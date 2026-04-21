@@ -1,0 +1,23 @@
+[package]
+name = "cwdit-synth"
+description = "CW audio synthesiser — renders Morse text to a mono PCM WAV"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+default-run = "cwdit-synth"
+
+[[bin]]
+name = "cwdit-synth"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+cwdit-morse = { path = "../cwdit-morse" }
+hound = "3.5"
+
+[dev-dependencies]
+cwdit-source = { path = "../cwdit-source" }
+
+[lints]
+workspace = true

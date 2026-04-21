@@ -1,0 +1,17 @@
+[package]
+name = "cwdit-dsp"
+description = "Pure DSP primitives for the cw-dit skimmer: envelope detection, thresholding, run-length coding"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+cwdit-morse = { path = "../cwdit-morse" }
+cwdit-source = { path = "../cwdit-source" }
+cwdit-synth = { path = "../cwdit-synth" }
+
+[lints]
+workspace = true

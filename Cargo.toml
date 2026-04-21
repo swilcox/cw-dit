@@ -1,0 +1,24 @@
+[workspace]
+resolver = "3"
+members = ["cwdit-cli","cwdit-dsp","cwdit-morse", "cwdit-server", "cwdit-source", "cwdit-synth"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/swilcox/cw-dit"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"
+# DSP code converts between integer sample counts and floating-point
+# continuously; the pedantic cast lints fire on every one of them.
+cast_possible_truncation = "allow"
+cast_possible_wrap = "allow"
+cast_precision_loss = "allow"
+cast_sign_loss = "allow"

@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>cw-dit</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0c0d10;
+    --fg: #e6e6e6;
+    --mute: #7a828c;
+    --accent: #4ea1ff;
+    --warn: #f88;
+  }
+  body {
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    background: var(--bg);
+    color: var(--fg);
+    margin: 0;
+    padding: 2rem;
+    max-width: 60rem;
+    margin-inline: auto;
+  }
+  h1 { margin: 0 0 0.25rem; font-weight: 500; }
+  #status {
+    color: var(--mute);
+    font-size: 0.9rem;
+    margin-bottom: 0.5rem;
+  }
+  #meta {
+    color: var(--mute);
+    font-size: 0.85rem;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    margin-bottom: 1rem;
+  }
+  #decoded {
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 1.6rem;
+    white-space: pre-wrap;
+    word-break: break-word;
+    padding: 1rem 1.25rem;
+    background: #000;
+    border: 1px solid #1e2128;
+    border-radius: 6px;
+    min-height: 8rem;
+  }
+  #decoded .unknown { color: var(--warn); }
+  #decoded.done { border-color: var(--accent); }
+</style>
+</head>
+<body>
+  <h1>cw-dit</h1>
+  <div id="status">connecting&hellip;</div>
+  <div id="meta"></div>
+  <div id="decoded"></div>
+
+<script>
+(function () {
+  const decoded = document.getElementById('decoded');
+  const statusEl = document.getElementById('status');
+  const metaEl = document.getElementById('meta');
+
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const ws = new WebSocket(`${proto}//${location.host}/ws`);
+
+  ws.addEventListener('open', () => { statusEl.textContent = 'connected'; });
+  ws.addEventListener('close', () => { statusEl.textContent = 'disconnected'; });
+  ws.addEventListener('error', () => { statusEl.textContent = 'error'; });
+
+  ws.addEventListener('message', (msg) => {
+    let ev;
+    try { ev = JSON.parse(msg.data); } catch (_) { return; }
+    switch (ev.type) {
+      case 'meta':
+        metaEl.textContent =
+          `${ev.input} · ${ev.sample_rate} Hz · ${ev.tone} Hz tone · ${ev.wpm} WPM`;
+        break;
+      case 'char':
+        decoded.append(ev.char);
+        break;
+      case 'word_break':
+        decoded.append(' ');
+        break;
+      case 'unknown': {
+        const span = document.createElement('span');
+        span.className = 'unknown';
+        span.textContent = '?';
+        decoded.append(span);
+        break;
+      }
+      case 'done':
+        statusEl.textContent = 'done';
+        decoded.classList.add('done');
+        break;
+    }
+  });
+})();
+</script>
+</body>
+</html>

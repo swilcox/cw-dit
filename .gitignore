@@ -1,0 +1,23 @@
+# Rust / Cargo
+/target/
+**/target/
+Cargo.lock.bak
+
+# Editor / IDE
+.vscode/
+.idea/
+*.iml
+.direnv/
+.envrc.local
+
+# Claude Code — keep any shared project settings but not per-user state
+.claude/settings.local.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local scratch — anything the project explicitly treats as throwaway
+*.wav.scratch
+/scratch/
+/tmp/
