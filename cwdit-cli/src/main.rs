@@ -1,10 +1,12 @@
-//! `cwdit` — headless command-line decoder for narrow-band CW WAV files.
+//! `cwdit` — headless command-line decoder for narrow-band CW audio.
 //!
-//! Wires `cwdit-source::WavSource` → `cwdit-dsp` (Goertzel bank → Threshold →
+//! Wires a `cwdit-source::Source` → `cwdit-dsp` (Goertzel bank → Threshold →
 //! `RunLengthEncoder`) → `cwdit-morse::Decoder` and streams the decoded text
-//! to stdout. In single-channel mode the decoded characters stream live;
-//! in multi-channel mode each channel's text is printed on its own line
-//! once the file has been fully processed.
+//! to stdout. The input is either a mono PCM WAV file (`INPUT`) or the
+//! default system audio input (`--live`). In single-channel mode the
+//! decoded characters stream live; in multi-channel mode each channel's
+//! text is printed on its own line once the file has been fully processed
+//! (file input only — live audio requires single-channel for now).
 
 use std::error::Error;
 use std::io::{self, Write};
@@ -13,7 +15,7 @@ use std::path::PathBuf;
 use clap::Parser;
 use cwdit_dsp::{GoertzelBank, RunLengthEncoder, Threshold};
 use cwdit_morse::{Decoded, Decoder, TimingEstimator};
-use cwdit_source::{Source, WavSource};
+use cwdit_source::{AudioSource, Source, WavSource};
 
 /// Minimum Goertzel block length, regardless of sample rate / tone.
 const MIN_BLOCK_LEN: u32 = 16;
@@ -32,12 +34,22 @@ const DEFAULT_MULTI_ON_FLOOR: f32 = 0.08;
 #[command(
     name = "cwdit",
     version,
-    about = "Decode a narrow-band CW WAV file to text",
+    about = "Decode narrow-band CW from a WAV file or live audio input",
     long_about = None,
 )]
 struct Args {
-    /// Path to a mono PCM WAV file containing CW.
-    input: PathBuf,
+    /// Path to a mono PCM WAV file containing CW. Omit when using --live.
+    #[arg(required_unless_present = "live", conflicts_with = "live")]
+    input: Option<PathBuf>,
+
+    /// Decode live audio from the default system input device.
+    #[arg(long, default_value_t = false)]
+    live: bool,
+
+    /// Name of the audio input device to use with --live. Defaults to the
+    /// system default input.
+    #[arg(long, requires = "live")]
+    device: Option<String>,
 
     /// Target tone frequency in Hz. Ignored when --channels is given.
     #[arg(short = 't', long, default_value_t = 700.0)]
@@ -109,7 +121,27 @@ fn main() {
 }
 
 fn run(args: &Args) -> Result<(), Box<dyn Error>> {
-    let mut source = WavSource::from_path(&args.input)?;
+    if args.live {
+        if args.channels.as_ref().is_some_and(|c| c.len() > 1) {
+            return Err("multi-channel live audio is not yet supported".into());
+        }
+        let source = AudioSource::with_device(args.device.as_deref())?;
+        eprintln!(
+            "cwdit: live audio at {:.0} Hz — press Ctrl+C to stop",
+            source.sample_rate()
+        );
+        decode(args, source)
+    } else {
+        let path = args
+            .input
+            .as_ref()
+            .expect("clap requires input when --live is absent");
+        let source = WavSource::from_path(path)?;
+        decode(args, source)
+    }
+}
+
+fn decode<S: Source<Sample = f32>>(args: &Args, mut source: S) -> Result<(), Box<dyn Error>> {
     let sample_rate = source.sample_rate();
     let tones = args.tones();
     let multi = tones.len() > 1;

@@ -4,13 +4,15 @@
 //! Concrete implementations live in submodules; pull them in under a feature
 //! gate where appropriate.
 //!
-//! Step 2 of the project only needs [`wav::WavSource`], which reads a mono
-//! WAV file and yields real-valued `f32` samples in `[-1.0, 1.0]`.
+//! Currently provides [`wav::WavSource`] for mono PCM WAV files and
+//! [`audio::AudioSource`] for live input from a system audio device.
 
 use std::fmt;
 
+pub mod audio;
 pub mod wav;
 
+pub use audio::AudioSource;
 pub use wav::WavSource;
 
 /// A stream of samples at a fixed sample rate.

@@ -19,8 +19,9 @@ fn help_prints_usage_and_exits_zero() {
     let out = Command::new(bin).arg("--help").output().unwrap();
     assert!(out.status.success());
     let s = String::from_utf8(out.stdout).unwrap();
-    assert!(s.contains("Decode a narrow-band CW WAV"));
+    assert!(s.contains("Decode narrow-band CW"));
     assert!(s.contains("--tone"));
+    assert!(s.contains("--live"));
 }
 
 #[test]

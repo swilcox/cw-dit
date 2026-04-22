@@ -34,6 +34,15 @@ cargo run -p cwdit-synth -- -o /tmp/two.wav \
 cargo run -p cwdit-cli   -- /tmp/two.wav --channels 600,1400 --wpm 18
 ```
 
+Live audio from the default system input (e.g. feed a receiver's audio output
+into the soundcard):
+
+```sh
+cargo run -p cwdit-cli -- --live --tone 700 --wpm 18
+```
+
+Pick a specific input device with `--device "Name"`.
+
 ## Development
 
 ```sh
