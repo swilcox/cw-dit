@@ -34,6 +34,25 @@ cargo run -p cwdit-synth -- -o /tmp/two.wav \
 cargo run -p cwdit-cli   -- /tmp/two.wav --channels 600,1400 --wpm 18
 ```
 
+FFT channelizer mode — one FFT drives every channel, so decoding many
+simultaneous signals scales better than one Goertzel per tone. The FFT size
+and hop are auto-selected from `--wpm` to cover slow CW through contest
+speeds (40 WPM+); override with `--fft-size` / `--hop` if you want to pin
+them:
+
+```sh
+cargo run -p cwdit-cli -- /tmp/two.wav --fft --channels 600,1400 --wpm 30
+```
+
+Auto-detect every CW signal in the passband — no `--channels` list needed.
+The first few seconds of audio are analysed for occupied bins (keyed peaks
+above the noise floor, with sidelobe / keying-sideband suppression), then
+every detected signal gets its own decoder:
+
+```sh
+cargo run -p cwdit-cli -- /tmp/recording.wav --fft --scan --wpm 25
+```
+
 Live audio from the default system input (e.g. feed a receiver's audio output
 into the soundcard):
 

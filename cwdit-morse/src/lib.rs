@@ -23,10 +23,12 @@
 //! ```
 
 pub mod alphabet;
+pub mod bootstrap;
 pub mod decoder;
 pub mod element;
 pub mod timing;
 
+pub use bootstrap::{BootstrapDecoder, DEFAULT_BOOTSTRAP_MARKS};
 pub use decoder::{Decoder, DecodedBatch};
 pub use element::{Decoded, Element, Gap};
 pub use timing::TimingEstimator;
