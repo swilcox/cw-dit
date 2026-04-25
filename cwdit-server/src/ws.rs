@@ -7,20 +7,16 @@ use tokio::sync::mpsc;
 use crate::AppState;
 use crate::pipeline::{self, Event};
 
-/// Handle one upgraded WebSocket. Sends the [`Event::Meta`] header first,
-/// then streams decode events until the pipeline finishes or the client
-/// disconnects.
+/// Handle one upgraded WebSocket. Runs the decode pipeline (which emits
+/// its own `Session` event first) and streams events until the stream
+/// finishes or the client disconnects.
 pub async fn handle(mut socket: WebSocket, state: AppState) {
-    if !send_event(&mut socket, &Event::from(&state.meta)).await {
-        return;
-    }
-
     let (tx, mut rx) = mpsc::channel::<Event>(256);
     tokio::spawn(pipeline::pump(
+        state.input.clone(),
         state.samples.clone(),
         state.sample_rate,
-        state.tone,
-        state.wpm,
+        state.cfg.clone(),
         state.pace_factor,
         tx,
     ));

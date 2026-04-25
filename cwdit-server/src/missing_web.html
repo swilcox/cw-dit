@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>cw-dit — web assets missing</title>
+<style>
+  body {
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    background: #0c0d10;
+    color: #e6e6e6;
+    margin: 0;
+    padding: 2rem;
+    max-width: 48rem;
+    margin-inline: auto;
+  }
+  h1 { font-weight: 500; margin-top: 0; }
+  code {
+    background: #141519;
+    border: 1px solid #1e2128;
+    border-radius: 4px;
+    padding: 0.1rem 0.35rem;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  }
+  pre {
+    background: #141519;
+    border: 1px solid #1e2128;
+    border-radius: 4px;
+    padding: 0.75rem 1rem;
+    overflow-x: auto;
+  }
+  a { color: #4ea1ff; }
+</style>
+</head>
+<body>
+<h1>cw-dit — web assets missing</h1>
+<p>The server is running, but the SvelteKit frontend hasn't been built yet.
+Decode events are still available on <code>/ws</code>.</p>
+
+<h2>Build and serve the UI</h2>
+<pre>cd web
+npm install
+npm run build</pre>
+<p>Then restart <code>cwdit-server</code>, or pass a custom location:</p>
+<pre>cwdit-server --web-dir path/to/build ...</pre>
+
+<h2>Dev mode (hot reload)</h2>
+<pre>cd web &amp;&amp; npm run dev</pre>
+<p>Vite serves on <code>:5173</code> and proxies <code>/ws</code> to this
+process automatically.</p>
+</body>
+</html>

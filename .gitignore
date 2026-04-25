@@ -21,3 +21,8 @@ Thumbs.db
 *.wav.scratch
 /scratch/
 /tmp/
+
+# SvelteKit frontend
+/web/node_modules/
+/web/.svelte-kit/
+/web/build/

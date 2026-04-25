@@ -8,7 +8,7 @@ Cross-platform multi-channel CW / Morse decoder in Rust.
 - **cwdit-dsp** — Goertzel bank, hysteretic slicer, run-length encoder.
 - **cwdit-source** — `Source` trait and a mono PCM WAV reader.
 - **cwdit-cli** — `cwdit` command-line decoder (single or multi-channel).
-- **cwdit-server** — Axum + WebSocket front-end with a minimal web UI.
+- **cwdit-server** — Axum + WebSocket back-end for the SvelteKit web UI in `web/`.
 - **cwdit-synth** — CW audio synthesiser (library + `cwdit-synth` binary) for generating fixtures and demos.
 
 ## Quick start
@@ -20,10 +20,23 @@ cargo run -p cwdit-synth -- -o /tmp/cq.wav -t "CQ DE W1AW" -f 700 -w 18
 cargo run -p cwdit-cli   -- /tmp/cq.wav --tone 700 --wpm 18
 ```
 
-Serve the web UI at `http://127.0.0.1:3000`:
+Serve the web UI. The frontend is a SvelteKit SPA in `web/`; build it once,
+then start the Rust server:
 
 ```sh
+(cd web && npm install && npm run build)
 cargo run -p cwdit-server -- /tmp/cq.wav -t 700 -w 18
+```
+
+Open `http://127.0.0.1:3000`. Pass `--web-dir path/to/build` if the built
+assets live somewhere other than `web/build/`.
+
+For frontend hot reload run Vite separately — it proxies `/ws` to the Rust
+server automatically:
+
+```sh
+cargo run -p cwdit-server -- /tmp/cq.wav -t 700 -w 18 &
+(cd web && npm run dev)   # serves the UI at http://127.0.0.1:5173
 ```
 
 Multi-channel:
