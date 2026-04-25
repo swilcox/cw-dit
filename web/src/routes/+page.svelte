@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { onDestroy, onMount } from 'svelte';
 	import Channel from '$lib/Channel.svelte';
+	import Waterfall from '$lib/Waterfall.svelte';
 	import type { DecodeEvent, SessionMode, Token } from '$lib/types';
 
 	interface ChannelState {
@@ -18,6 +19,9 @@
 	let scanNote = $state<string | null>(null);
 	let channels = $state<Record<number, ChannelState>>({});
 	let done = $state(false);
+	let spectrumFrame = $state<Uint8Array | null>(null);
+	let spectrumFMin = $state(0);
+	let spectrumFMax = $state(0);
 	let ws: WebSocket | null = null;
 
 	const channelList = $derived(
@@ -81,11 +85,23 @@
 				if (c) c.wpm = ev.wpm;
 				break;
 			}
+			case 'spectrum':
+				spectrumFrame = base64ToBytes(ev.bins);
+				spectrumFMin = ev.f_min;
+				spectrumFMax = ev.f_max;
+				break;
 			case 'done':
 				done = true;
 				connectionStatus = 'done';
 				break;
 		}
+	}
+
+	function base64ToBytes(s: string): Uint8Array {
+		const bin = atob(s);
+		const out = new Uint8Array(bin.length);
+		for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+		return out;
 	}
 </script>
 
@@ -99,6 +115,11 @@
 	{#if sessionInput}
 		<div class="meta">
 			{sessionInput} · {sampleRate} Hz · mode: {sessionMode}
+		</div>
+	{/if}
+	{#if spectrumFrame}
+		<div class="waterfall-wrap">
+			<Waterfall frame={spectrumFrame} fMin={spectrumFMin} fMax={spectrumFMax} />
 		</div>
 	{/if}
 	<div class="channels">
@@ -151,6 +172,9 @@
 	.channels {
 		display: grid;
 		gap: 0.75rem;
+	}
+	.waterfall-wrap {
+		margin-bottom: 1rem;
 	}
 	.empty {
 		color: var(--mute);

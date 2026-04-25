@@ -50,6 +50,20 @@ export interface DoneEvent {
 	type: 'done';
 }
 
+export interface SpectrumEvent {
+	type: 'spectrum';
+	/** base64 of a Uint8Array — one byte per FFT bin (DC … Nyquist). */
+	bins: string;
+	/** Centre frequency of the first bin (Hz). */
+	f_min: number;
+	/** Centre frequency of the last bin (Hz). */
+	f_max: number;
+	/** dB value mapped to byte 0. */
+	db_floor: number;
+	/** dB value mapped to byte 255. */
+	db_ceiling: number;
+}
+
 export type DecodeEvent =
 	| SessionEvent
 	| ScanStatusEvent
@@ -58,6 +72,7 @@ export type DecodeEvent =
 	| WordBreakEvent
 	| UnknownEvent
 	| WpmEvent
+	| SpectrumEvent
 	| DoneEvent;
 
 // The text shown for one channel is a stream of tokens: regular characters,

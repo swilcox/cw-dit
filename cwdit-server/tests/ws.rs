@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use base64::Engine as _;
 use cwdit_server::{ServerConfig, build_app};
 use cwdit_synth::{SynthOptions, Track, synth_to_path};
 use futures_util::StreamExt;
@@ -59,6 +60,9 @@ struct Collected {
     session_mode: Option<String>,
     channels: HashMap<u64, ChannelInfo>,
     got_done: bool,
+    spectrum_count: usize,
+    spectrum_bin_count: Option<usize>,
+    spectrum_f_max: Option<f64>,
 }
 
 struct ChannelInfo {
@@ -107,6 +111,19 @@ async fn collect_events(url: String, timeout: Duration) -> Collected {
                 "unknown" => {
                     let id = ev["channel"].as_u64().unwrap();
                     out.channels.get_mut(&id).unwrap().text.push('?');
+                }
+                "spectrum" => {
+                    out.spectrum_count += 1;
+                    if out.spectrum_bin_count.is_none() {
+                        let b64 = ev["bins"].as_str().unwrap();
+                        // Decoded length = 3/4 of base64 length when no
+                        // padding is needed; we just want a non-zero count
+                        // and consistency across frames.
+                        let decoded =
+                            base64::engine::general_purpose::STANDARD.decode(b64).unwrap();
+                        out.spectrum_bin_count = Some(decoded.len());
+                        out.spectrum_f_max = ev["f_max"].as_f64();
+                    }
                 }
                 "done" => {
                     out.got_done = true;
@@ -199,6 +216,59 @@ async fn ws_streams_multi_channel_with_fixed_tones() {
     assert!((ch1.freq_hz - 1400.0).abs() < 50.0, "ch1 freq {}", ch1.freq_hz);
     assert!(ch0.text.contains("W1AW"), "ch0 decoded: {:?}", ch0.text);
     assert!(ch1.text.contains("K5ABC"), "ch1 decoded: {:?}", ch1.text);
+}
+
+#[tokio::test]
+async fn ws_emits_spectrum_when_fft_enabled() {
+    let wav = tmp_wav("spectrum");
+    write_synth(&wav, &[Track::new("CQ TEST", 22.0, 800.0)], 8_000);
+
+    let app = build_app(&ServerConfig {
+        wpm: 22.0,
+        fft: true,
+        ..base_config(wav.clone())
+    })
+    .expect("build_app");
+
+    let (addr, server) = bind_app(app).await;
+    let out = collect_events(format!("ws://{addr}/ws"), Duration::from_secs(15)).await;
+
+    let _ = std::fs::remove_file(&wav);
+    server.abort();
+
+    assert!(out.got_done, "never received done event");
+    assert!(
+        out.spectrum_count >= 4,
+        "expected several spectrum frames, got {}",
+        out.spectrum_count,
+    );
+    let bin_count = out.spectrum_bin_count.unwrap();
+    assert!(bin_count > 16, "implausibly few bins: {bin_count}");
+    // f_max should match the Nyquist of an 8 kHz source.
+    let f_max = out.spectrum_f_max.unwrap();
+    assert!((f_max - 4_000.0).abs() < 1.0, "unexpected f_max: {f_max}");
+}
+
+#[tokio::test]
+async fn ws_does_not_emit_spectrum_in_goertzel_mode() {
+    let wav = tmp_wav("nospectrum");
+    write_synth(&wav, &[Track::new("E", 25.0, 700.0)], 8_000);
+
+    let app = build_app(&ServerConfig {
+        wpm: 25.0,
+        // fft defaults to false; Goertzel backend has no spectrum view.
+        ..base_config(wav.clone())
+    })
+    .expect("build_app");
+
+    let (addr, server) = bind_app(app).await;
+    let out = collect_events(format!("ws://{addr}/ws"), Duration::from_secs(10)).await;
+
+    let _ = std::fs::remove_file(&wav);
+    server.abort();
+
+    assert!(out.got_done);
+    assert_eq!(out.spectrum_count, 0, "Goertzel mode must not emit spectrum");
 }
 
 #[tokio::test]

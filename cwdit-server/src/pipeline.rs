@@ -10,6 +10,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use cwdit_dsp::{
     BinStats, FftChannelizer, GoertzelBank, RunLengthEncoder, ScanConfig, Threshold,
 };
@@ -36,6 +37,13 @@ const MAX_AUTO_FFT_SIZE: usize = 4096;
 /// Emit a `wpm` event only when a channel's estimate has moved this much
 /// since the last emission. Keeps the stream quiet during steady-state.
 const WPM_EVENT_THRESHOLD: f32 = 0.5;
+/// Target waterfall frame rate (frames per second). The pump decimates
+/// the channelizer's native frame rate to land near this.
+const SPECTRUM_TARGET_FPS: f32 = 25.0;
+/// Lower edge of the dB range mapped to `u8` 0 in spectrum frames.
+const SPECTRUM_DB_FLOOR: f32 = -80.0;
+/// Upper edge of the dB range mapped to `u8` 255 in spectrum frames.
+const SPECTRUM_DB_CEILING: f32 = 0.0;
 
 /// Per-connection processing configuration. Clone-friendly (small, no IO).
 #[derive(Clone, Debug)]
@@ -93,6 +101,21 @@ pub enum Event {
     Wpm {
         channel: u32,
         wpm: f32,
+    },
+    /// One row of waterfall data — magnitudes for the positive half of the
+    /// FFT, dB-scaled into 0..=255 and base64-encoded. Only emitted when
+    /// the FFT backend is in use.
+    Spectrum {
+        /// Base64-encoded `Vec<u8>`, one byte per FFT bin (DC … Nyquist).
+        bins: String,
+        /// Centre frequency of bin 0 (always 0 Hz today).
+        f_min: f32,
+        /// Centre frequency of the last bin (`sample_rate / 2`).
+        f_max: f32,
+        /// dB value mapped to byte 0.
+        db_floor: f32,
+        /// dB value mapped to byte 255.
+        db_ceiling: f32,
     },
     /// End of stream — no further events will be sent.
     Done,
@@ -207,7 +230,7 @@ pub async fn pump(
     let multi = tones.len() > 1;
     let on_floor = if multi { DEFAULT_MULTI_ON_FLOOR } else { 0.0 };
 
-    let mut backend: Box<dyn EnvelopeProducer + Send> = if cfg.fft {
+    let mut backend: Box<dyn EnvelopeProducer + Send + Sync> = if cfg.fft {
         let fft_size = auto_fft_size(sample_rate, cfg.wpm);
         let hop = auto_hop(sample_rate, cfg.wpm, fft_size);
         Box::new(FftBackend::new(fft_size, hop, sample_rate, &tones))
@@ -235,23 +258,23 @@ pub async fn pump(
     }
 
     let mut env_scratch = vec![0.0_f32; tones.len()];
+    let mut spectrum = cfg
+        .fft
+        .then(|| SpectrumEmitter::new(env_rate, sample_rate));
 
     // Scan prefetch: blast the buffered calibration samples through the
     // real decode pipeline as fast as possible so any characters sent
     // during calibration land on the UI right after channel_open.
     for &sample in &samples[..cursor] {
-        if feed_sample(
-            sample,
-            &mut backend,
-            &mut chains,
-            &mut env_scratch,
-            env_rate,
-            &tx,
-        )
-        .await
-        .is_break()
+        match feed_sample(sample, &mut backend, &mut chains, &mut env_scratch, env_rate, &tx).await
         {
-            return;
+            FeedOutcome::Break => return,
+            FeedOutcome::NoFrame => {}
+            FeedOutcome::Frame => {
+                if !emit_spectrum(spectrum.as_mut(), backend.as_ref(), &tx).await {
+                    return;
+                }
+            }
         }
     }
 
@@ -259,7 +282,7 @@ pub async fn pump(
     for chunk in samples[cursor..].chunks(chunk_samples) {
         interval.tick().await;
         for &sample in chunk {
-            if feed_sample(
+            match feed_sample(
                 sample,
                 &mut backend,
                 &mut chains,
@@ -268,9 +291,14 @@ pub async fn pump(
                 &tx,
             )
             .await
-            .is_break()
             {
-                return;
+                FeedOutcome::Break => return,
+                FeedOutcome::NoFrame => {}
+                FeedOutcome::Frame => {
+                    if !emit_spectrum(spectrum.as_mut(), backend.as_ref(), &tx).await {
+                        return;
+                    }
+                }
             }
         }
     }
@@ -286,29 +314,43 @@ pub async fn pump(
     let _ = tx.send(Event::Done).await;
 }
 
-/// Outcome of a single-sample push. `Break` signals that the downstream
-/// receiver is gone and we should tear down the pump.
-enum FeedOutcome {
-    Continue,
-    Break,
+/// If the FFT backend produced a frame this push and the cadence counter
+/// is due, send a `Spectrum` event. Returns `false` only when the receiver
+/// has gone away.
+async fn emit_spectrum(
+    emitter: Option<&mut SpectrumEmitter>,
+    backend: &(dyn EnvelopeProducer + Send + Sync),
+    tx: &mpsc::Sender<Event>,
+) -> bool {
+    let Some(emitter) = emitter else { return true };
+    let Some(mag) = backend.latest_spectrum() else {
+        return true;
+    };
+    let Some(ev) = emitter.maybe_emit(mag) else {
+        return true;
+    };
+    tx.send(ev).await.is_ok()
 }
 
-impl FeedOutcome {
-    fn is_break(&self) -> bool {
-        matches!(self, FeedOutcome::Break)
-    }
+/// Outcome of a single-sample push. `Frame` means the backend produced a
+/// new envelope frame (so the caller may also want to emit a spectrum
+/// event); `Break` signals the downstream receiver is gone.
+enum FeedOutcome {
+    NoFrame,
+    Frame,
+    Break,
 }
 
 async fn feed_sample(
     sample: f32,
-    backend: &mut Box<dyn EnvelopeProducer + Send>,
+    backend: &mut Box<dyn EnvelopeProducer + Send + Sync>,
     chains: &mut [ChannelChain],
     env_scratch: &mut [f32],
     env_rate: f32,
     tx: &mpsc::Sender<Event>,
 ) -> FeedOutcome {
     if !backend.push(sample, env_scratch) {
-        return FeedOutcome::Continue;
+        return FeedOutcome::NoFrame;
     }
     for (idx, chain) in chains.iter_mut().enumerate() {
         let events = chain.feed_envelope(env_scratch[idx]);
@@ -324,7 +366,7 @@ async fn feed_sample(
             return FeedOutcome::Break;
         }
     }
-    FeedOutcome::Continue
+    FeedOutcome::Frame
 }
 
 async fn send_decoded(tx: &mpsc::Sender<Event>, channel: u32, ev: Decoded) -> bool {
@@ -429,6 +471,10 @@ trait EnvelopeProducer {
     /// same order as [`push`]'s output slots. For FFT channels this is
     /// the bin centre, which may differ from the requested tone.
     fn frequencies(&self) -> Vec<f32>;
+    /// Most recent full-spectrum magnitudes, when this backend produces
+    /// one (FFT only). Returns `None` for backends that don't have a
+    /// full-band view (Goertzel) or when no frame has been emitted yet.
+    fn latest_spectrum(&self) -> Option<&[f32]>;
 }
 
 struct GoertzelBackend {
@@ -464,12 +510,20 @@ impl EnvelopeProducer for GoertzelBackend {
     fn frequencies(&self) -> Vec<f32> {
         self.tones.clone()
     }
+
+    fn latest_spectrum(&self) -> Option<&[f32]> {
+        None
+    }
 }
 
 struct FftBackend {
     channelizer: FftChannelizer,
     bins: Vec<usize>,
     actual_freqs: Vec<f32>,
+    /// Magnitudes of the most recent FFT frame, kept around so the pump
+    /// can read them after `push` returns. Sized to `channel_count()`.
+    mag_frame: Vec<f32>,
+    has_frame: bool,
 }
 
 impl FftBackend {
@@ -478,10 +532,13 @@ impl FftBackend {
         let bins: Vec<usize> = tones.iter().map(|&t| channelizer.bin_index_for(t)).collect();
         let actual_freqs: Vec<f32> =
             bins.iter().map(|&b| channelizer.bin_frequency(b)).collect();
+        let mag_frame = vec![0.0_f32; channelizer.channel_count()];
         Self {
             channelizer,
             bins,
             actual_freqs,
+            mag_frame,
+            has_frame: false,
         }
     }
 }
@@ -489,9 +546,13 @@ impl FftBackend {
 impl EnvelopeProducer for FftBackend {
     fn push(&mut self, sample: f32, envs: &mut [f32]) -> bool {
         if let Some(frame) = self.channelizer.push(sample) {
-            for (slot, &bin) in envs.iter_mut().zip(&self.bins) {
-                *slot = frame[bin].norm();
+            for (slot, c) in self.mag_frame.iter_mut().zip(frame) {
+                *slot = c.norm();
             }
+            for (slot, &bin) in envs.iter_mut().zip(&self.bins) {
+                *slot = self.mag_frame[bin];
+            }
+            self.has_frame = true;
             true
         } else {
             false
@@ -504,6 +565,10 @@ impl EnvelopeProducer for FftBackend {
 
     fn frequencies(&self) -> Vec<f32> {
         self.actual_freqs.clone()
+    }
+
+    fn latest_spectrum(&self) -> Option<&[f32]> {
+        self.has_frame.then_some(self.mag_frame.as_slice())
     }
 }
 
@@ -565,4 +630,69 @@ impl ChannelChain {
             None
         }
     }
+}
+
+/// Cadence-controlled encoder for `Spectrum` events. Lives for the
+/// duration of one connection.
+struct SpectrumEmitter {
+    /// Number of envelope frames to skip between emits. Computed once
+    /// from the backend's frame rate to target [`SPECTRUM_TARGET_FPS`].
+    decimate: u32,
+    counter: u32,
+    /// Reusable byte scratch sized to the FFT bin count on first emit.
+    bytes: Vec<u8>,
+    /// Frequency span the bins cover. Sent with each event so the UI is
+    /// self-describing without holding session state.
+    f_min: f32,
+    f_max: f32,
+}
+
+impl SpectrumEmitter {
+    fn new(env_rate: f32, sample_rate: f32) -> Self {
+        // env_rate is the channelizer's frame rate. We want roughly
+        // SPECTRUM_TARGET_FPS frames per second going to the wire; emit
+        // once every Nth frame.
+        let decimate = (env_rate / SPECTRUM_TARGET_FPS).round().max(1.0) as u32;
+        Self {
+            decimate,
+            // Start at decimate-1 so the very first frame produces an
+            // immediate emit — gives the UI something to draw without a
+            // ~40 ms warmup pause.
+            counter: decimate.saturating_sub(1),
+            bytes: Vec::new(),
+            f_min: 0.0,
+            f_max: sample_rate / 2.0,
+        }
+    }
+
+    fn maybe_emit(&mut self, mag: &[f32]) -> Option<Event> {
+        self.counter += 1;
+        if self.counter < self.decimate {
+            return None;
+        }
+        self.counter = 0;
+        if self.bytes.len() != mag.len() {
+            self.bytes.resize(mag.len(), 0);
+        }
+        for (b, &m) in self.bytes.iter_mut().zip(mag) {
+            *b = mag_to_u8(m);
+        }
+        Some(Event::Spectrum {
+            bins: BASE64.encode(&self.bytes),
+            f_min: self.f_min,
+            f_max: self.f_max,
+            db_floor: SPECTRUM_DB_FLOOR,
+            db_ceiling: SPECTRUM_DB_CEILING,
+        })
+    }
+}
+
+/// Map a linear FFT magnitude to a 0..=255 brightness using a fixed dB
+/// window. Floor / ceiling come from [`SPECTRUM_DB_FLOOR`] /
+/// [`SPECTRUM_DB_CEILING`].
+fn mag_to_u8(mag: f32) -> u8 {
+    let db = 20.0 * mag.max(1e-10).log10();
+    let span = SPECTRUM_DB_CEILING - SPECTRUM_DB_FLOOR;
+    let t = (db - SPECTRUM_DB_FLOOR) / span;
+    (t.clamp(0.0, 1.0) * 255.0).round() as u8
 }

@@ -425,6 +425,7 @@ name = "cwdit-server"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64",
  "clap",
  "cwdit-dsp",
  "cwdit-morse",
