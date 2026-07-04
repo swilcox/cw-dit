@@ -16,6 +16,15 @@ clap = { version = "4.5", features = ["derive"] }
 cwdit-dsp = { path = "../cwdit-dsp" }
 cwdit-morse = { path = "../cwdit-morse" }
 cwdit-source = { path = "../cwdit-source" }
+# rustfft re-exports num-complex; pulling it in here avoids a separate
+# version-pin for the IQ backend's Complex32 plumbing.
+rustfft = "6.4"
+
+[features]
+default = []
+# Enable SDR live IQ via SoapySDR. Forwards to the matching feature on
+# cwdit-source so the radio bindings only build when actually requested.
+soapy = ["cwdit-source/soapy"]
 
 [dev-dependencies]
 cwdit-synth = { path = "../cwdit-synth" }

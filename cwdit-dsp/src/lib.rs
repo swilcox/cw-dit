@@ -14,6 +14,7 @@
 pub mod bank;
 pub mod channelizer;
 pub mod envelope;
+pub mod iq_channelizer;
 pub mod runlength;
 pub mod scan;
 pub mod threshold;
@@ -21,6 +22,7 @@ pub mod threshold;
 pub use bank::GoertzelBank;
 pub use channelizer::FftChannelizer;
 pub use envelope::Goertzel;
+pub use iq_channelizer::IqChannelizer;
 pub use runlength::{Run, RunLengthEncoder};
 pub use scan::{BinStats, ScanConfig};
 pub use threshold::Threshold;

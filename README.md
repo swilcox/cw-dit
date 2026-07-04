@@ -6,7 +6,7 @@ Cross-platform multi-channel CW / Morse decoder in Rust.
 
 - **cwdit-morse** — streaming Morse decoder with adaptive timing.
 - **cwdit-dsp** — Goertzel bank, hysteretic slicer, run-length encoder.
-- **cwdit-source** — `Source` trait and a mono PCM WAV reader.
+- **cwdit-source** — `Source` trait, a mono PCM WAV reader, live audio via cpal, and (with `--features soapy`) live IQ via SoapySDR.
 - **cwdit-cli** — `cwdit` command-line decoder (single or multi-channel).
 - **cwdit-server** — Axum + WebSocket back-end for the SvelteKit web UI in `web/`.
 - **cwdit-synth** — CW audio synthesiser (library + `cwdit-synth` binary) for generating fixtures and demos.
@@ -74,6 +74,52 @@ cargo run -p cwdit-cli -- --live --tone 700 --wpm 18
 ```
 
 Pick a specific input device with `--device "Name"`.
+
+## SDR (live IQ via SoapySDR)
+
+Skim every CW signal across the radio's full sampled bandwidth in one pass.
+Built behind the `soapy` cargo feature so the SoapySDR linkage is opt-in.
+
+Install the host bits once (macOS examples — pick the driver modules that
+match your hardware):
+
+```sh
+brew install soapysdr soapyrtlsdr soapysdrplay3
+SoapySDRUtil --probe="driver=sdrplay"   # smoke-test once each radio is plugged in
+SoapySDRUtil --probe="driver=rtlsdr"
+```
+
+`soapysdrplay3` requires the closed-source SDRplay API service to be running
+for the SDRplay to enumerate; install it from sdrplay.com if `--probe` can't
+find the device.
+
+Scan a CW segment of 40 m on an SDRplay (default driver):
+
+```sh
+cargo run -p cwdit-cli --features soapy -- \
+    --sdr --freq 7035000 --rf-rate 2000000 --scan --wpm 25
+```
+
+RTL-SDR with explicit driver args and manual gain:
+
+```sh
+cargo run -p cwdit-cli --features soapy -- \
+    --sdr "driver=rtlsdr" --freq 7040000 --rf-rate 1024000 \
+    --rf-gain 30 --scan --wpm 25
+```
+
+Decode a fixed list of RF tones instead of scanning:
+
+```sh
+cargo run -p cwdit-cli --features soapy -- \
+    --sdr --freq 7035000 --rf-rate 2000000 \
+    --channels 7035500,7038200,7041000 --wpm 22
+```
+
+Defaults: `--sdr` alone uses `driver=sdrplay`; `--rf-rate` defaults to
+1.024 Msps; `--rf-gain` is omitted to enable hardware AGC. Scan covers the
+whole sampled passband minus a 5 % guard at each edge unless
+`--scan-min-freq` / `--scan-max-freq` (in absolute RF Hz) override.
 
 ## Development
 

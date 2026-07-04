@@ -9,6 +9,15 @@ repository.workspace = true
 [dependencies]
 cpal = "0.15"
 hound = "3.5"
+num-complex = { version = "0.4", optional = true }
+soapysdr = { version = "0.4", optional = true }
+
+[features]
+# Live IQ from SDR hardware via SoapySDR. Requires libSoapySDR on PATH and the
+# relevant per-radio module (SoapyRTLSDR, SoapySDRPlay3, etc.) to be installed
+# at runtime; cargo will also need them present at link time when this feature
+# is enabled.
+soapy = ["dep:soapysdr", "dep:num-complex"]
 
 [lints]
 workspace = true
