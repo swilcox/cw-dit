@@ -58,6 +58,15 @@ struct Args {
     /// Peak post-mix amplitude (0.0–1.0).
     #[arg(long, default_value_t = 0.8)]
     amplitude: f32,
+
+    /// Add white Gaussian noise at this SNR in dB (full-band, against one
+    /// keyed track's tone power). Omit for a clean render.
+    #[arg(long)]
+    noise_snr_db: Option<f32>,
+
+    /// Seed for the deterministic noise generator.
+    #[arg(long, default_value_t = 0x5EED_CAFE_F00D_D00D)]
+    noise_seed: u64,
 }
 
 fn main() {
@@ -82,6 +91,8 @@ fn run(args: &Args) -> Result<(), Box<dyn Error>> {
         tail_silence_s: args.tail,
         ramp_ms: args.ramp_ms,
         amplitude: args.amplitude,
+        noise_snr_db: args.noise_snr_db,
+        noise_seed: args.noise_seed,
     };
     synth_to_path(&args.output, &tracks, &options)?;
     Ok(())

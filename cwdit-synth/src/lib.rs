@@ -41,6 +41,15 @@ pub struct SynthOptions {
     /// Peak output amplitude in [0.0, 1.0] relative to i16 full-scale.
     /// Tracks are normalised so that the post-mix peak lands here.
     pub amplitude: f32,
+    /// Add white Gaussian noise at this SNR in dB, measured full-band
+    /// against one keyed track's tone power. `None` adds no noise. The
+    /// noise spans the whole file (lead and tail silence included) and is
+    /// mixed before normalisation, so the SNR survives output scaling and
+    /// the result never clips.
+    pub noise_snr_db: Option<f32>,
+    /// Seed for the noise generator; renders are fully deterministic for a
+    /// given seed, which is what test fixtures want.
+    pub noise_seed: u64,
 }
 
 impl Default for SynthOptions {
@@ -51,6 +60,8 @@ impl Default for SynthOptions {
             tail_silence_s: 0.2,
             ramp_ms: 10.0,
             amplitude: 0.8,
+            noise_snr_db: None,
+            noise_seed: 0x5EED_CAFE_F00D_D00D,
         }
     }
 }
@@ -170,6 +181,17 @@ pub fn synth_bytes(tracks: &[Track], options: &SynthOptions) -> Result<Vec<u8>, 
         }
     }
 
+    if let Some(snr_db) = options.noise_snr_db {
+        // Each track is keyed at unit amplitude before normalisation, so a
+        // tone's power here is 1/2; solve for the noise variance that puts
+        // it `snr_db` below that.
+        let noise_std = (0.5 / 10.0_f32.powf(snr_db / 10.0)).sqrt();
+        let mut rng = NoiseGen::new(options.noise_seed);
+        for s in &mut mix {
+            *s += noise_std * rng.next_gaussian();
+        }
+    }
+
     // Normalise so the post-mix peak never exceeds `amplitude`. When the
     // mix sits below unit amplitude (e.g. a single track), we leave the
     // peak at exactly `amplitude` — matching the existing test fixtures.
@@ -204,4 +226,117 @@ pub fn synth_to_path(
     let bytes = synth_bytes(tracks, options)?;
     std::fs::write(path, bytes)?;
     Ok(())
+}
+
+/// Deterministic Gaussian noise source: xorshift64* uniforms fed through
+/// Box–Muller. Self-contained so fixtures don't pull in a rand dependency.
+struct NoiseGen {
+    state: u64,
+    spare: Option<f32>,
+}
+
+impl NoiseGen {
+    fn new(seed: u64) -> Self {
+        Self {
+            // xorshift never leaves the all-zero state.
+            state: if seed == 0 { 0xBAD_5EED } else { seed },
+            spare: None,
+        }
+    }
+
+    /// Uniform in (0, 1] — the half-open end matters so `ln` below never
+    /// sees zero.
+    fn next_uniform(&mut self) -> f32 {
+        self.state ^= self.state >> 12;
+        self.state ^= self.state << 25;
+        self.state ^= self.state >> 27;
+        let r = self.state.wrapping_mul(0x2545_F491_4F6C_DD1D);
+        ((r >> 40) as f32 + 1.0) / 16_777_216.0
+    }
+
+    /// Standard normal sample via Box–Muller (pairs cached in `spare`).
+    fn next_gaussian(&mut self) -> f32 {
+        if let Some(s) = self.spare.take() {
+            return s;
+        }
+        let radius = (-2.0 * self.next_uniform().ln()).sqrt();
+        let theta = 2.0 * std::f32::consts::PI * self.next_uniform();
+        self.spare = Some(radius * theta.sin());
+        radius * theta.cos()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn opts(noise_snr_db: Option<f32>, noise_seed: u64) -> SynthOptions {
+        SynthOptions {
+            noise_snr_db,
+            noise_seed,
+            ..SynthOptions::default()
+        }
+    }
+
+    fn samples(bytes: &[u8]) -> Vec<i16> {
+        let mut reader = hound::WavReader::new(Cursor::new(bytes.to_vec())).expect("wav");
+        reader.samples::<i16>().map(|s| s.expect("sample")).collect()
+    }
+
+    #[test]
+    fn noise_render_is_deterministic() {
+        let tracks = [Track::new("CQ", 20.0, 700.0)];
+        let a = synth_bytes(&tracks, &opts(Some(10.0), 7)).expect("synth");
+        let b = synth_bytes(&tracks, &opts(Some(10.0), 7)).expect("synth");
+        assert_eq!(a, b, "same seed must render identical bytes");
+    }
+
+    #[test]
+    fn different_seeds_render_different_noise() {
+        let tracks = [Track::new("CQ", 20.0, 700.0)];
+        let a = synth_bytes(&tracks, &opts(Some(10.0), 1)).expect("synth");
+        let b = synth_bytes(&tracks, &opts(Some(10.0), 2)).expect("synth");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn noise_fills_the_lead_silence() {
+        let tracks = [Track::new("E", 20.0, 700.0)];
+        let clean = synth_bytes(&tracks, &opts(None, 1)).expect("synth");
+        let noisy = synth_bytes(&tracks, &opts(Some(10.0), 1)).expect("synth");
+        // First 0.1 s sits inside the default 0.2 s lead: silent when
+        // clean, non-silent when noise is requested.
+        let head = 800;
+        assert!(samples(&clean)[..head].iter().all(|&s| s == 0));
+        let sum_sq: f64 = samples(&noisy)[..head]
+            .iter()
+            .map(|&s| f64::from(s) * f64::from(s))
+            .sum();
+        let rms = (sum_sq / head as f64).sqrt();
+        assert!(rms > 100.0, "lead should carry audible noise, rms={rms}");
+    }
+
+    #[test]
+    fn noise_level_matches_requested_snr() {
+        // 10 dB SNR: tone power P, noise power P/10. Measure noise power in
+        // the lead silence and tone+noise power mid-file, both relative to
+        // the same normalisation.
+        let tracks = [Track::new("OOO", 20.0, 700.0)];
+        let bytes = synth_bytes(&tracks, &opts(Some(10.0), 42)).expect("synth");
+        let all = samples(&bytes);
+        let power = |s: &[i16]| {
+            s.iter()
+                .map(|&x| f64::from(x) * f64::from(x))
+                .sum::<f64>()
+                / s.len() as f64
+        };
+        let noise_p = power(&all[..1_200]); // lead: noise only
+        // "O" = dah dah dah; the first dah spans 0.2 s..0.38 s.
+        let mark_p = power(&all[1_800..2_800]) - noise_p; // first dah, noise removed
+        let snr_db = 10.0 * (mark_p / noise_p).log10();
+        assert!(
+            (snr_db - 10.0).abs() < 1.5,
+            "expected ~10 dB, measured {snr_db:.1} dB"
+        );
+    }
 }

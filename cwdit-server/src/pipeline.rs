@@ -12,7 +12,8 @@ use std::time::Duration;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use cwdit_dsp::{
-    BinStats, FftChannelizer, GoertzelBank, RunLengthEncoder, ScanConfig, Threshold,
+    BinStats, Debouncer, FftChannelizer, GoertzelBank, MovingAverage, RunLengthEncoder,
+    ScanConfig, Threshold,
 };
 use cwdit_morse::{BootstrapDecoder, Decoded, TimingEstimator};
 use cwdit_source::{Source, SourceError, WavSource};
@@ -574,31 +575,40 @@ impl EnvelopeProducer for FftBackend {
 
 /// Per-channel decode pipeline state.
 struct ChannelChain {
+    smoother: MovingAverage,
     threshold: Threshold,
     rle: RunLengthEncoder,
+    debouncer: Debouncer,
     decoder: BootstrapDecoder,
     last_reported_wpm: f32,
 }
 
 impl ChannelChain {
     fn new(env_rate: f32, wpm: f32, on_floor: f32) -> Self {
+        // Smooth over ~1/4 dit and absorb runs under ~1/5 dit, sized from
+        // the seed WPM (see the cwdit-cli chain for the rationale).
+        let dit_ticks = 1.2 * env_rate / wpm;
+        let smooth_len = ((dit_ticks / 4.0).round() as usize).clamp(2, 16);
+        let min_run = ((dit_ticks / 5.0) as u32).max(2);
         let mut threshold = Threshold::new(env_rate, PEAK_HALF_LIFE_S, MIN_PEAK);
         if on_floor > 0.0 {
             threshold = threshold.with_absolute_on_floor(on_floor);
         }
         let decoder = BootstrapDecoder::new(TimingEstimator::from_wpm(wpm, env_rate));
         Self {
+            smoother: MovingAverage::new(smooth_len),
             threshold,
             rle: RunLengthEncoder::new(),
+            debouncer: Debouncer::new(min_run),
             decoder,
             last_reported_wpm: wpm,
         }
     }
 
     fn feed_envelope(&mut self, env: f32) -> Vec<Decoded> {
-        let mark = self.threshold.push(env);
+        let mark = self.threshold.push(self.smoother.push(env));
         let mut out = Vec::new();
-        if let Some(run) = self.rle.push(mark) {
+        if let Some(run) = self.rle.push(mark).and_then(|r| self.debouncer.push(r)) {
             for ev in self.decoder.push(run.mark, run.duration) {
                 out.push(ev);
             }
@@ -608,7 +618,11 @@ impl ChannelChain {
 
     fn finish(&mut self) -> Vec<Decoded> {
         let mut out = Vec::new();
-        if let Some(run) = self.rle.finish() {
+        let tail = [
+            self.rle.finish().and_then(|r| self.debouncer.push(r)),
+            self.debouncer.finish(),
+        ];
+        for run in tail.into_iter().flatten() {
             for ev in self.decoder.push(run.mark, run.duration) {
                 out.push(ev);
             }

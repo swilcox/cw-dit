@@ -22,6 +22,16 @@ const MIN_UNIT: f32 = 1.0;
 /// Weight given to a newly observed dit when adapting the dot-unit.
 const DIT_ADAPT_ALPHA: f32 = 0.2;
 
+/// Implied dot-units outside `unit × [MIN..MAX]_ADAPT_RATIO` never adapt
+/// the estimate. The lower bound is the important one: on a noisy channel
+/// a glitch mark of a tick or two classifies as a "dit", and without the
+/// guard each one drags the unit down 20% — a few in a row collapse the
+/// estimate and every real element then reads as a dah. The upper bound
+/// symmetrically ignores marks stretched to absurdity by a noise merge,
+/// while staying wide enough (3×) for genuine speed changes to adapt.
+const MIN_ADAPT_RATIO: f32 = 0.5;
+const MAX_ADAPT_RATIO: f32 = 3.0;
+
 /// Adaptive estimator of the Morse dot-unit `T`.
 ///
 /// The estimator holds a single value — the current `T` — and answers two
@@ -112,12 +122,19 @@ impl TimingEstimator {
     /// Dah observations are used more conservatively than dit observations:
     /// the signal is noisier because dahs span 3 units and small errors in
     /// an operator's fist affect them proportionally less.
+    ///
+    /// Marks whose implied dot-unit is implausible against the current
+    /// estimate (see [`MIN_ADAPT_RATIO`]/[`MAX_ADAPT_RATIO`]) are treated
+    /// as noise glitches and ignored.
     pub fn observe_mark(&mut self, duration: u32, element: Element) {
         let target = match element {
             Element::Dit => duration as f32,
             // A dah is nominally 3 T; infer what T would make this dah exact.
             Element::Dah => duration as f32 / 3.0,
         };
+        if target < MIN_ADAPT_RATIO * self.unit || target > MAX_ADAPT_RATIO * self.unit {
+            return;
+        }
         let alpha = match element {
             Element::Dit => DIT_ADAPT_ALPHA,
             Element::Dah => DIT_ADAPT_ALPHA * 0.5,
@@ -187,6 +204,41 @@ mod tests {
         assert!(
             (t.unit() as i32 - 50).abs() <= 3,
             "expected unit≈50, got {}",
+            t.unit()
+        );
+    }
+
+    #[test]
+    fn glitch_marks_do_not_move_the_unit() {
+        let mut t = TimingEstimator::from_unit(60);
+        // 1-tick noise blips classify as dits; they must not adapt.
+        for _ in 0..100 {
+            t.observe_mark(1, Element::Dit);
+        }
+        assert_eq!(t.unit(), 60, "glitches collapsed the unit estimate");
+    }
+
+    #[test]
+    fn absurdly_long_marks_do_not_move_the_unit() {
+        let mut t = TimingEstimator::from_unit(60);
+        // A noise merge stretched a "dah" to 20 T; implied unit 6.7 T is
+        // beyond MAX_ADAPT_RATIO and must be ignored.
+        for _ in 0..100 {
+            t.observe_mark(1_200, Element::Dah);
+        }
+        assert_eq!(t.unit(), 60, "noise merges dragged the unit estimate up");
+    }
+
+    #[test]
+    fn plausible_marks_still_adapt_within_the_guard() {
+        let mut t = TimingEstimator::from_unit(60);
+        // Operator is 25% slower than the seed — inside the guard band.
+        for _ in 0..50 {
+            t.observe_mark(75, Element::Dit);
+        }
+        assert!(
+            (t.unit() as i32 - 75).abs() <= 2,
+            "expected unit≈75, got {}",
             t.unit()
         );
     }

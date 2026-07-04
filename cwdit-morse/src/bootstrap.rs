@@ -154,14 +154,26 @@ impl BootstrapDecoder {
 
 /// Estimate the Morse dot-unit from a set of observed mark durations.
 ///
-/// Takes the median of the shorter half — the peak of the dit mode in a
-/// bimodal distribution, robust to a small number of outliers in either
-/// direction. Assumes at least a handful of dits are present in the
-/// sample; with too few marks, returns whichever value sits at the
-/// quarter-point of the sorted durations.
+/// Marks shorter than 1/12 of the longest mark are discarded first: real
+/// marks span at most 3:1 (dah:dit), so anything below max/12 is a noise
+/// glitch, and on a noisy channel glitches can outnumber real dits —
+/// enough to capture a plain lower-half median. The longest mark itself
+/// always survives the cut, so the filtered set is never empty.
+///
+/// From the survivors, takes the median of the shorter half — the peak of
+/// the dit mode in a bimodal distribution, robust to a small number of
+/// outliers in either direction. Assumes at least a handful of dits are
+/// present in the sample; with too few marks, returns whichever value sits
+/// at the quarter-point of the sorted durations.
 fn estimate_unit_from_marks(durations: &[u32]) -> u32 {
     assert!(!durations.is_empty());
-    let mut sorted: Vec<u32> = durations.to_vec();
+    let longest = *durations.iter().max().expect("non-empty");
+    let glitch_floor = longest / 12;
+    let mut sorted: Vec<u32> = durations
+        .iter()
+        .copied()
+        .filter(|&d| d > glitch_floor)
+        .collect();
     sorted.sort_unstable();
     let half = sorted.len() / 2;
     let lower = if half == 0 { &sorted[..1] } else { &sorted[..half] };
@@ -294,8 +306,23 @@ mod tests {
     fn unit_estimator_robust_to_one_outlier() {
         // One spuriously short mark among otherwise sensible dit/dah data.
         let unit = estimate_unit_from_marks(&[2, 20, 20, 20, 60, 60, 60]);
-        // Median of lower half ([2, 20, 20]) = 20 — the spurious 2 is
-        // ignored.
+        assert_eq!(unit, 20);
+    }
+
+    #[test]
+    fn unit_estimator_survives_a_glitch_majority() {
+        // A noisy lead-in can hand bootstrap more glitches than real
+        // marks. The glitch filter (max/12 = 5) must drop them before the
+        // lower-half median, or the estimate collapses to 1.
+        let unit = estimate_unit_from_marks(&[1, 1, 1, 2, 20, 20, 60, 60]);
+        assert_eq!(unit, 20);
+    }
+
+    #[test]
+    fn unit_estimator_handles_all_dit_input() {
+        // "EEE": no dahs, so the longest mark is itself a dit — the glitch
+        // floor (20/12 = 1) must not eat the real marks.
+        let unit = estimate_unit_from_marks(&[20, 20, 20]);
         assert_eq!(unit, 20);
     }
 }

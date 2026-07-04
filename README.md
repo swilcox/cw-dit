@@ -5,11 +5,12 @@ Cross-platform multi-channel CW / Morse decoder in Rust.
 ## Workspace
 
 - **cwdit-morse** — streaming Morse decoder with adaptive timing.
-- **cwdit-dsp** — Goertzel bank, hysteretic slicer, run-length encoder.
+- **cwdit-dsp** — Goertzel bank, envelope smoothing, noise-floor-tracking
+  slicer with SNR squelch, run-length encoder, glitch debouncer.
 - **cwdit-source** — `Source` trait, a mono PCM WAV reader, live audio via cpal, and (with `--features soapy`) live IQ via SoapySDR.
 - **cwdit-cli** — `cwdit` command-line decoder (single or multi-channel).
 - **cwdit-server** — Axum + WebSocket back-end for the SvelteKit web UI in `web/`.
-- **cwdit-synth** — CW audio synthesiser (library + `cwdit-synth` binary) for generating fixtures and demos.
+- **cwdit-synth** — CW audio synthesiser (library + `cwdit-synth` binary) for generating fixtures and demos, with optional calibrated noise (`--noise-snr-db`).
 
 ## Quick start
 

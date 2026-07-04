@@ -15,7 +15,8 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use cwdit_dsp::{
-    BinStats, FftChannelizer, GoertzelBank, IqChannelizer, RunLengthEncoder, ScanConfig, Threshold,
+    BinStats, Debouncer, FftChannelizer, GoertzelBank, IqChannelizer, MovingAverage,
+    RunLengthEncoder, ScanConfig, Threshold,
 };
 use cwdit_morse::{BootstrapDecoder, Decoded, TimingEstimator};
 use cwdit_source::{AudioSource, Source, WavSource};
@@ -137,6 +138,11 @@ struct Args {
     /// Absolute-envelope floor below which the slicer will never turn on.
     #[arg(long)]
     on_floor: Option<f32>,
+
+    /// SNR gate: minimum peak/noise-floor ratio (linear) before the slicer
+    /// reports key-down. 1.0 disables the gate. Default ~6 dB.
+    #[arg(long)]
+    snr_gate: Option<f32>,
 
     /// Disable per-channel adaptive timing.
     #[arg(long, default_value_t = false)]
@@ -451,6 +457,7 @@ where
                 args.peak_half_life,
                 args.min_peak,
                 on_floor,
+                args.snr_gate,
                 !args.fixed_timing,
             )
         })
@@ -811,8 +818,10 @@ impl Backend for IqFftBackend {
 
 /// Per-channel decode pipeline state.
 struct ChannelChain {
+    smoother: MovingAverage,
     threshold: Threshold,
     rle: RunLengthEncoder,
+    debouncer: Debouncer,
     decoder: BootstrapDecoder,
     text: String,
 }
@@ -824,26 +833,40 @@ impl ChannelChain {
         peak_half_life_s: f32,
         min_peak: f32,
         on_floor: f32,
+        snr_gate: Option<f32>,
         adapt: bool,
     ) -> Self {
+        // Smooth over ~1/4 dit and absorb runs under ~1/5 dit, both from
+        // the seed WPM so a channel keying up to ~3x faster than the seed
+        // still keeps its dits intact. Floors of 2: below that the smoother
+        // passes raw Rayleigh noise excursions and the debouncer passes
+        // 1-tick glitches, and the slicer's SNR gate alone can't hold.
+        let dit_ticks = 1.2 * env_rate / wpm;
+        let smooth_len = ((dit_ticks / 4.0).round() as usize).clamp(2, 16);
+        let min_run = ((dit_ticks / 5.0) as u32).max(2);
         let mut threshold = Threshold::new(env_rate, peak_half_life_s, min_peak);
         if on_floor > 0.0 {
             threshold = threshold.with_absolute_on_floor(on_floor);
         }
+        if let Some(gate) = snr_gate {
+            threshold = threshold.with_snr_gate(gate);
+        }
         let decoder =
             BootstrapDecoder::new(TimingEstimator::from_wpm(wpm, env_rate)).with_adapt(adapt);
         Self {
+            smoother: MovingAverage::new(smooth_len),
             threshold,
             rle: RunLengthEncoder::new(),
+            debouncer: Debouncer::new(min_run),
             decoder,
             text: String::new(),
         }
     }
 
     fn feed_envelope(&mut self, env: f32) -> Vec<Decoded> {
-        let mark = self.threshold.push(env);
+        let mark = self.threshold.push(self.smoother.push(env));
         let mut out = Vec::new();
-        if let Some(run) = self.rle.push(mark) {
+        if let Some(run) = self.rle.push(mark).and_then(|r| self.debouncer.push(r)) {
             for ev in self.decoder.push(run.mark, run.duration) {
                 self.accumulate(ev);
                 out.push(ev);
@@ -854,7 +877,11 @@ impl ChannelChain {
 
     fn finish(&mut self) -> Vec<Decoded> {
         let mut out = Vec::new();
-        if let Some(run) = self.rle.finish() {
+        let tail = [
+            self.rle.finish().and_then(|r| self.debouncer.push(r)),
+            self.debouncer.finish(),
+        ];
+        for run in tail.into_iter().flatten() {
             for ev in self.decoder.push(run.mark, run.duration) {
                 self.accumulate(ev);
                 out.push(ev);
