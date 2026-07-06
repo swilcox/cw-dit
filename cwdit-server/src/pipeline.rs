@@ -2,9 +2,14 @@
 //!
 //! `pump` runs one of these per WebSocket, driving either a Goertzel bank
 //! or an FFT channelizer into per-channel Threshold → `RunLengthEncoder` →
-//! `BootstrapDecoder` chains and emitting JSON-friendly [`Event`]s. Handles
-//! the three input modes of the CLI: fixed single tone, fixed multi-channel
-//! (`tones.len() > 1`), and auto-detect (`scan`).
+//! `BootstrapDecoder` chains and emitting JSON-friendly [`Event`]s.
+//!
+//! Two modes: **fixed** (single tone or `--channels` list, channels
+//! announced up-front) and **scan**, which skims continuously — a
+//! [`Detector`] re-runs detection every calibration interval, a
+//! [`ChannelTracker`] spawns and retires per-tone Goertzel decode
+//! channels (`channel_open` / `channel_close` events), and the detection
+//! channelizer's frames feed the waterfall, cropped to the scanned band.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -12,29 +17,25 @@ use std::time::Duration;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use cwdit_dsp::{
-    BinStats, Debouncer, FftChannelizer, GoertzelBank, MovingAverage, RunLengthEncoder,
-    ScanConfig, Threshold,
+    ChannelTracker, Debouncer, Detector, DetectorConfig, FftChannelizer, Goertzel, GoertzelBank,
+    MovingAverage, RunLengthEncoder, Threshold, TrackerConfig, skim,
 };
 use cwdit_morse::{BootstrapDecoder, Decoded, TimingEstimator};
 use cwdit_source::{Source, SourceError, WavSource};
 use serde::Serialize;
 use tokio::sync::mpsc;
 
-/// Minimum Goertzel block length regardless of sample rate / tone.
-const MIN_BLOCK_LEN: u32 = 16;
-/// Goertzel block-length multiplier (≈ this many cycles of the lowest tone).
-const DEFAULT_BLOCK_CYCLES: f32 = 4.0;
-/// Envelope floor used in multi-channel mode to reject sidelobe leakage.
+/// Envelope floor used in fixed multi-channel mode to reject sidelobe
+/// leakage on blind channel lists. Scan-spawned channels run un-floored —
+/// they already cleared the detector's SNR gate.
 const DEFAULT_MULTI_ON_FLOOR: f32 = 0.08;
 /// Peak-detector half-life for the envelope slicer, in seconds.
 const PEAK_HALF_LIFE_S: f32 = 1.0;
 /// Minimum envelope peak used as a noise-floor guard (0.0–1.0).
 const MIN_PEAK: f32 = 0.005;
-/// Auto-hop target: envelope samples per dit.
-const TARGET_SAMPLES_PER_DIT: f32 = 10.0;
-/// Auto-selected FFT size bounds.
-const MIN_AUTO_FFT_SIZE: usize = 128;
-const MAX_AUTO_FFT_SIZE: usize = 4096;
+/// A detection this close to a live channel refreshes it instead of
+/// spawning a duplicate.
+const SKIM_MATCH_RADIUS_HZ: f32 = 25.0;
 /// Emit a `wpm` event only when a channel's estimate has moved this much
 /// since the last emission. Keeps the stream quiet during steady-state.
 const WPM_EVENT_THRESHOLD: f32 = 0.5;
@@ -59,6 +60,8 @@ pub struct PipelineConfig {
     pub scan_nms_radius: usize,
     pub scan_min_freq: f32,
     pub scan_max_freq: f32,
+    /// Seconds a skimmed channel may go undetected before `channel_close`.
+    pub channel_timeout: f32,
 }
 
 /// Events sent to a connected WebSocket client. Serialised as
@@ -80,12 +83,19 @@ pub enum Event {
         detected: Option<usize>,
     },
     /// Announces one channel that will subsequently produce decode
-    /// events. Emitted up-front in `fixed` mode and after scan completion
-    /// in `scan` mode. `id` is stable for the life of the connection.
+    /// events. Emitted up-front in `fixed` mode; in `scan` mode channels
+    /// open whenever a new station is detected. `id` is stable for the
+    /// life of the connection and never reused.
     ChannelOpen {
         id: u32,
         freq_hz: f32,
         wpm: f32,
+    },
+    /// A skimmed channel went undetected past the timeout and was
+    /// retired. Its decoded text stays valid; no further events carry
+    /// this id. Scan mode only.
+    ChannelClose {
+        id: u32,
     },
     Char {
         channel: u32,
@@ -192,9 +202,7 @@ pub async fn pump(
     let mut interval = tokio::time::interval(chunk_period);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-    // Decide tones and which samples still need to be decoded.
-    let mut cursor = 0_usize;
-    let tones: Vec<f32> = if cfg.scan {
+    if cfg.scan {
         if tx
             .send(Event::ScanStatus {
                 state: ScanState::Calibrating,
@@ -205,24 +213,22 @@ pub async fn pump(
         {
             return;
         }
-        let (detected, scan_end) =
-            run_scan(&cfg, &samples, sample_rate, chunk_samples, &mut interval).await;
-        cursor = scan_end;
-        if tx
-            .send(Event::ScanStatus {
-                state: ScanState::Ready,
-                detected: Some(detected.len()),
-            })
-            .await
-            .is_err()
-        {
-            return;
+        let mut state = SkimState::new(&cfg, sample_rate);
+        for chunk in samples.chunks(chunk_samples) {
+            interval.tick().await;
+            for &sample in chunk {
+                if !state.push(sample, &tx).await {
+                    return;
+                }
+            }
         }
-        detected
-    } else {
-        cfg.tones.clone()
-    };
+        if state.finish(&tx).await {
+            let _ = tx.send(Event::Done).await;
+        }
+        return;
+    }
 
+    let tones = cfg.tones.clone();
     if tones.is_empty() {
         let _ = tx.send(Event::Done).await;
         return;
@@ -232,11 +238,12 @@ pub async fn pump(
     let on_floor = if multi { DEFAULT_MULTI_ON_FLOOR } else { 0.0 };
 
     let mut backend: Box<dyn EnvelopeProducer + Send + Sync> = if cfg.fft {
-        let fft_size = auto_fft_size(sample_rate, cfg.wpm);
-        let hop = auto_hop(sample_rate, cfg.wpm, fft_size);
+        let fft_size = skim::decode_fft_size(sample_rate, cfg.wpm);
+        let hop = skim::auto_hop(sample_rate, cfg.wpm, fft_size);
         Box::new(FftBackend::new(fft_size, hop, sample_rate, &tones))
     } else {
-        let block_len = resolved_block_len(sample_rate, &tones);
+        let lowest = tones.iter().copied().fold(f32::INFINITY, f32::min);
+        let block_len = skim::decode_block_len(sample_rate, cfg.wpm, lowest);
         Box::new(GoertzelBackend::new(sample_rate, &tones, block_len))
     };
     let env_rate = backend.envelope_sample_rate();
@@ -261,26 +268,9 @@ pub async fn pump(
     let mut env_scratch = vec![0.0_f32; tones.len()];
     let mut spectrum = cfg
         .fft
-        .then(|| SpectrumEmitter::new(env_rate, sample_rate));
+        .then(|| SpectrumEmitter::new(env_rate, 0.0, sample_rate / 2.0));
 
-    // Scan prefetch: blast the buffered calibration samples through the
-    // real decode pipeline as fast as possible so any characters sent
-    // during calibration land on the UI right after channel_open.
-    for &sample in &samples[..cursor] {
-        match feed_sample(sample, &mut backend, &mut chains, &mut env_scratch, env_rate, &tx).await
-        {
-            FeedOutcome::Break => return,
-            FeedOutcome::NoFrame => {}
-            FeedOutcome::Frame => {
-                if !emit_spectrum(spectrum.as_mut(), backend.as_ref(), &tx).await {
-                    return;
-                }
-            }
-        }
-    }
-
-    // Remaining samples run at the paced rate.
-    for chunk in samples[cursor..].chunks(chunk_samples) {
+    for chunk in samples.chunks(chunk_samples) {
         interval.tick().await;
         for &sample in chunk {
             match feed_sample(
@@ -379,85 +369,199 @@ async fn send_decoded(tx: &mpsc::Sender<Event>, channel: u32, ev: Decoded) -> bo
     tx.send(event).await.is_ok()
 }
 
-/// Drive the first `scan_duration` seconds of `samples` through an FFT
-/// channelizer purely to collect per-bin statistics, then detect occupied
-/// bins. Returns the detected centre frequencies alongside the index into
-/// `samples` where the calibration window ended (so the caller can replay
-/// those same samples through the real decode pipeline).
-async fn run_scan(
-    cfg: &PipelineConfig,
-    samples: &[f32],
+/// One live skim channel: a Goertzel filter on the detected tone feeding
+/// its own decode chain. `id` is the wire-protocol channel id.
+struct SkimChannel {
+    id: u32,
+    filter: Goertzel,
+    chain: ChannelChain,
+}
+
+/// Continuous scan-mode state: a [`Detector`] finds stations per
+/// calibration interval, a [`ChannelTracker`] decides lifecycle, and each
+/// live station decodes through its own [`SkimChannel`]. Waterfall frames
+/// come from the detection channelizer, cropped to the scanned band.
+struct SkimState {
+    detector: Detector,
+    tracker: ChannelTracker,
+    channels: Vec<SkimChannel>,
+    spectrum: SpectrumEmitter,
+    /// Displayed bin range of a detection frame (the scanned band).
+    range: (usize, usize),
+    next_id: u32,
+    announced_ready: bool,
+    wpm: f32,
+    block_len: u32,
+    env_rate: f32,
     sample_rate: f32,
-    chunk_samples: usize,
-    interval: &mut tokio::time::Interval,
-) -> (Vec<f32>, usize) {
-    let fft_size = auto_fft_size(sample_rate, cfg.wpm);
-    let hop = auto_hop(sample_rate, cfg.wpm, fft_size);
-    let mut channelizer = FftChannelizer::new(fft_size, hop, sample_rate);
-    let mut stats = BinStats::new(channelizer.channel_count());
-    let mut mag_frame = vec![0.0_f32; channelizer.channel_count()];
+    total_samples: u64,
+}
 
-    let target_samples =
-        ((cfg.scan_duration * sample_rate) as usize).max(fft_size).min(samples.len());
-    let mut consumed = 0_usize;
+impl SkimState {
+    fn new(cfg: &PipelineConfig, sample_rate: f32) -> Self {
+        let fft_size = skim::detect_fft_size(sample_rate, cfg.wpm);
+        let detector = Detector::new(
+            &DetectorConfig {
+                fft_size,
+                hop: skim::auto_hop(sample_rate, cfg.wpm, fft_size),
+                min_freq_hz: cfg.scan_min_freq,
+                max_freq_hz: cfg.scan_max_freq,
+                snr_db: cfg.scan_snr_db,
+                nms_radius: cfg.scan_nms_radius,
+                max_channels: cfg.scan_max_channels,
+                interval_s: cfg.scan_duration,
+            },
+            sample_rate,
+        );
+        let range = detector.bin_range();
+        let spectrum = SpectrumEmitter::new(
+            detector.frame_rate(),
+            detector.bin_frequency(range.0),
+            detector.bin_frequency(range.1 - 1),
+        );
+        let block_len = skim::decode_block_len(sample_rate, cfg.wpm, cfg.scan_min_freq);
+        Self {
+            tracker: ChannelTracker::new(TrackerConfig {
+                match_radius_hz: SKIM_MATCH_RADIUS_HZ.max(sample_rate / fft_size as f32),
+                timeout_s: cfg.channel_timeout,
+                max_channels: cfg.scan_max_channels,
+            }),
+            channels: Vec::new(),
+            spectrum,
+            range,
+            next_id: 0,
+            announced_ready: false,
+            wpm: cfg.wpm,
+            block_len,
+            env_rate: sample_rate / block_len as f32,
+            sample_rate,
+            total_samples: 0,
+            detector,
+        }
+    }
 
-    for chunk in samples[..target_samples].chunks(chunk_samples) {
-        interval.tick().await;
-        for &sample in chunk {
-            if let Some(bins) = channelizer.push(sample) {
-                for (dst, c) in mag_frame.iter_mut().zip(bins) {
-                    *dst = c.norm();
-                }
-                stats.observe(&mag_frame);
+    /// Feed one input sample. Returns `false` when the receiver is gone.
+    async fn push(&mut self, sample: f32, tx: &mpsc::Sender<Event>) -> bool {
+        self.total_samples += 1;
+        for ch in &mut self.channels {
+            if !feed_skim_channel(ch, sample, self.env_rate, tx).await {
+                return false;
             }
         }
-        consumed += chunk.len();
+        if self.detector.push(sample)
+            && let Some(frame) = self.detector.latest_frame()
+            && let Some(ev) = self.spectrum.maybe_emit(&frame[self.range.0..self.range.1])
+            && tx.send(ev).await.is_err()
+        {
+            return false;
+        }
+        if self.detector.interval_complete() {
+            return self.detection_round(tx).await;
+        }
+        true
     }
 
-    let scan_cfg = ScanConfig {
-        peak_snr_db: cfg.scan_snr_db,
-        max_channels: cfg.scan_max_channels,
-        nms_radius: cfg.scan_nms_radius,
-        min_bin: channelizer.bin_index_for(cfg.scan_min_freq).max(1),
-        max_bin: Some(
-            (channelizer.bin_index_for(cfg.scan_max_freq) + 1).min(channelizer.channel_count()),
-        ),
-        ..ScanConfig::default()
+    /// End-of-interval bookkeeping: detect, reap, spawn (replaying the
+    /// discovery interval into each new channel), reset.
+    async fn detection_round(&mut self, tx: &mpsc::Sender<Event>) -> bool {
+        let tones = self.detector.detect();
+        let now_s = self.total_samples as f32 / self.sample_rate;
+        let update = self.tracker.observe(now_s, &tones);
+
+        for &idx in &update.reaped {
+            let mut ch = self.channels.remove(idx);
+            for ev in ch.chain.finish() {
+                if !send_decoded(tx, ch.id, ev).await {
+                    return false;
+                }
+            }
+            if tx.send(Event::ChannelClose { id: ch.id }).await.is_err() {
+                return false;
+            }
+        }
+
+        for &tone in &update.spawned {
+            let id = self.next_id;
+            self.next_id += 1;
+            let open = Event::ChannelOpen {
+                id,
+                freq_hz: tone,
+                wpm: self.wpm,
+            };
+            if tx.send(open).await.is_err() {
+                return false;
+            }
+            let mut ch = SkimChannel {
+                id,
+                filter: Goertzel::new(tone, self.sample_rate, self.block_len),
+                chain: ChannelChain::new(self.env_rate, self.wpm, 0.0),
+            };
+            // Replay the discovery interval so the transmission that
+            // triggered detection is decoded from its start.
+            for &s in self.detector.interval_audio() {
+                if !feed_skim_channel(&mut ch, s, self.env_rate, tx).await {
+                    return false;
+                }
+            }
+            self.channels.push(ch);
+        }
+
+        if !self.announced_ready {
+            self.announced_ready = true;
+            let ready = Event::ScanStatus {
+                state: ScanState::Ready,
+                detected: Some(self.channels.len()),
+            };
+            if tx.send(ready).await.is_err() {
+                return false;
+            }
+        }
+
+        self.detector.reset_interval();
+        true
+    }
+
+    /// Flush every live channel at end of input.
+    async fn finish(&mut self, tx: &mpsc::Sender<Event>) -> bool {
+        for ch in &mut self.channels {
+            for ev in ch.chain.finish() {
+                if !send_decoded(tx, ch.id, ev).await {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+}
+
+/// Feed one sample to a skim channel, forwarding decode and WPM events.
+/// Returns `false` when the receiver is gone.
+async fn feed_skim_channel(
+    ch: &mut SkimChannel,
+    sample: f32,
+    env_rate: f32,
+    tx: &mpsc::Sender<Event>,
+) -> bool {
+    let Some(env) = ch.filter.push(sample) else {
+        return true;
     };
-    let tones: Vec<f32> = stats
-        .detect(&scan_cfg)
-        .iter()
-        .map(|&b| channelizer.bin_frequency(b))
-        .collect();
-    (tones, consumed)
-}
-
-fn resolved_block_len(sample_rate: f32, tones: &[f32]) -> u32 {
-    let lowest = tones.iter().copied().fold(f32::INFINITY, f32::min);
-    let raw = (DEFAULT_BLOCK_CYCLES * sample_rate / lowest).round() as u32;
-    raw.max(MIN_BLOCK_LEN)
-}
-
-fn auto_fft_size(sample_rate: f32, wpm: f32) -> usize {
-    let dit_s = 1.2 / wpm;
-    let raw = sample_rate * dit_s;
-    let cap = if raw >= 1.0 { raw as usize } else { 1 };
-    prev_pow2(cap).clamp(MIN_AUTO_FFT_SIZE, MAX_AUTO_FFT_SIZE)
-}
-
-fn auto_hop(sample_rate: f32, wpm: f32, fft_size: usize) -> usize {
-    let dit_s = 1.2 / wpm;
-    let raw = (sample_rate * dit_s / TARGET_SAMPLES_PER_DIT).floor();
-    let hop = if raw >= 1.0 { raw as usize } else { 1 };
-    hop.clamp(1, fft_size / 2)
-}
-
-fn prev_pow2(n: usize) -> usize {
-    if n < 2 {
-        1
-    } else {
-        1usize << (usize::BITS - 1 - n.leading_zeros())
+    for ev in ch.chain.feed_envelope(env) {
+        if !send_decoded(tx, ch.id, ev).await {
+            return false;
+        }
     }
+    if let Some(wpm) = ch.chain.take_wpm_update(env_rate)
+        && tx
+            .send(Event::Wpm {
+                channel: ch.id,
+                wpm,
+            })
+            .await
+            .is_err()
+    {
+        return false;
+    }
+    true
 }
 
 /// Narrow trait over whatever DSP front end produces one envelope sample
@@ -662,11 +766,11 @@ struct SpectrumEmitter {
 }
 
 impl SpectrumEmitter {
-    fn new(env_rate: f32, sample_rate: f32) -> Self {
-        // env_rate is the channelizer's frame rate. We want roughly
+    fn new(frame_rate: f32, f_min: f32, f_max: f32) -> Self {
+        // frame_rate is the channelizer's frame rate. We want roughly
         // SPECTRUM_TARGET_FPS frames per second going to the wire; emit
         // once every Nth frame.
-        let decimate = (env_rate / SPECTRUM_TARGET_FPS).round().max(1.0) as u32;
+        let decimate = (frame_rate / SPECTRUM_TARGET_FPS).round().max(1.0) as u32;
         Self {
             decimate,
             // Start at decimate-1 so the very first frame produces an
@@ -674,8 +778,8 @@ impl SpectrumEmitter {
             // ~40 ms warmup pause.
             counter: decimate.saturating_sub(1),
             bytes: Vec::new(),
-            f_min: 0.0,
-            f_max: sample_rate / 2.0,
+            f_min,
+            f_max,
         }
     }
 

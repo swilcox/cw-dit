@@ -24,6 +24,12 @@ export interface ChannelOpenEvent {
 	wpm: number;
 }
 
+export interface ChannelCloseEvent {
+	type: 'channel_close';
+	/** Channel id that was retired (scan mode). Its text stays valid. */
+	id: number;
+}
+
 export interface CharEvent {
 	type: 'char';
 	channel: number;
@@ -68,6 +74,7 @@ export type DecodeEvent =
 	| SessionEvent
 	| ScanStatusEvent
 	| ChannelOpenEvent
+	| ChannelCloseEvent
 	| CharEvent
 	| WordBreakEvent
 	| UnknownEvent

@@ -30,6 +30,23 @@ fn write_synth(path: &Path, tracks: &[Track], sample_rate: u32) {
     .expect("synth");
 }
 
+/// Like [`write_synth`] but with band noise and a long noise-only tail,
+/// for scan-mode tests that need channels to idle out.
+fn write_synth_noisy(path: &Path, tracks: &[Track], sample_rate: u32, tail_silence_s: f32) {
+    synth_to_path(
+        path,
+        tracks,
+        &SynthOptions {
+            sample_rate,
+            noise_snr_db: Some(0.0),
+            noise_seed: 11,
+            tail_silence_s,
+            ..SynthOptions::default()
+        },
+    )
+    .expect("synth");
+}
+
 fn base_config(input: PathBuf) -> ServerConfig {
     ServerConfig {
         input,
@@ -39,11 +56,12 @@ fn base_config(input: PathBuf) -> ServerConfig {
         fft: false,
         scan: false,
         scan_duration: 3.0,
-        scan_snr_db: 12.0,
+        scan_snr_db: 8.0,
         scan_max_channels: 32,
         scan_nms_radius: 3,
         scan_min_freq: 300.0,
         scan_max_freq: 3000.0,
+        channel_timeout: 30.0,
         // Tests drive the WS directly and don't care about HTML assets;
         // `None` means axum serves the embedded stub at `/`.
         web_dir: None,
@@ -59,9 +77,11 @@ fn base_config(input: PathBuf) -> ServerConfig {
 struct Collected {
     session_mode: Option<String>,
     channels: HashMap<u64, ChannelInfo>,
+    closed_channels: Vec<u64>,
     got_done: bool,
     spectrum_count: usize,
     spectrum_bin_count: Option<usize>,
+    spectrum_f_min: Option<f64>,
     spectrum_f_max: Option<f64>,
 }
 
@@ -99,6 +119,9 @@ async fn collect_events(url: String, timeout: Duration) -> Collected {
                         },
                     );
                 }
+                "channel_close" => {
+                    out.closed_channels.push(ev["id"].as_u64().unwrap());
+                }
                 "char" => {
                     let id = ev["channel"].as_u64().unwrap();
                     let ch = ev["ch"].as_str().unwrap().chars().next().unwrap();
@@ -122,6 +145,7 @@ async fn collect_events(url: String, timeout: Duration) -> Collected {
                         let decoded =
                             base64::engine::general_purpose::STANDARD.decode(b64).unwrap();
                         out.spectrum_bin_count = Some(decoded.len());
+                        out.spectrum_f_min = ev["f_min"].as_f64();
                         out.spectrum_f_max = ev["f_max"].as_f64();
                     }
                 }
@@ -269,6 +293,73 @@ async fn ws_does_not_emit_spectrum_in_goertzel_mode() {
 
     assert!(out.got_done);
     assert_eq!(out.spectrum_count, 0, "Goertzel mode must not emit spectrum");
+}
+
+#[tokio::test]
+async fn ws_scan_mode_skims_dynamic_channels_with_waterfall() {
+    let wav = tmp_wav("skim");
+    // Station A keys from the start; station B (8 leading spaces ≈ 3.4 s
+    // of word gaps at 20 WPM) appears after the first calibration
+    // interval and must still get its own channel. A long noisy tail
+    // lets the channels idle out, exercising channel_close.
+    write_synth_noisy(
+        &wav,
+        &[
+            Track::new("CQ CQ DE K2D", 20.0, 620.0),
+            Track::new("        WD8DSV 5NN CT", 20.0, 900.0),
+        ],
+        8_000,
+        18.0,
+    );
+
+    let app = build_app(&ServerConfig {
+        scan: true,
+        channel_timeout: 4.0,
+        ..base_config(wav.clone())
+    })
+    .expect("build_app");
+
+    let (addr, server) = bind_app(app).await;
+    let out = collect_events(format!("ws://{addr}/ws"), Duration::from_secs(20)).await;
+
+    let _ = std::fs::remove_file(&wav);
+    server.abort();
+
+    assert_eq!(out.session_mode.as_deref(), Some("scan"));
+    assert!(out.got_done, "never received done event");
+    assert_eq!(out.channels.len(), 2, "expected two dynamic channels: {:?}",
+        out.channels.keys().collect::<Vec<_>>());
+
+    let by_freq = |target: f64| {
+        out.channels
+            .values()
+            .min_by(|a, b| {
+                (a.freq_hz - target).abs().total_cmp(&(b.freq_hz - target).abs())
+            })
+            .expect("channel")
+    };
+    let a = by_freq(620.0);
+    assert!((a.freq_hz - 620.0).abs() < 20.0, "A freq {}", a.freq_hz);
+    assert!(a.text.contains("K2D"), "A decoded: {:?}", a.text);
+    let b = by_freq(900.0);
+    assert!((b.freq_hz - 900.0).abs() < 20.0, "B freq {}", b.freq_hz);
+    assert!(b.text.contains("5NN"), "B decoded: {:?}", b.text);
+
+    // Both stations leave the air well before the tail ends; with a 4 s
+    // timeout both channels must close before done.
+    assert_eq!(out.closed_channels.len(), 2, "closed: {:?}", out.closed_channels);
+
+    // Scan mode drives the waterfall from the detection channelizer,
+    // cropped to the scanned band — not the full 0..Nyquist span.
+    assert!(
+        out.spectrum_count >= 4,
+        "expected waterfall frames in scan mode, got {}",
+        out.spectrum_count
+    );
+    let f_min = out.spectrum_f_min.unwrap();
+    let f_max = out.spectrum_f_max.unwrap();
+    assert!((250.0..=350.0).contains(&f_min), "f_min {f_min}");
+    assert!((2900.0..=3100.0).contains(&f_max), "f_max {f_max}");
 }
 
 #[tokio::test]

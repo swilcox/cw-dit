@@ -42,10 +42,12 @@ pub struct ServerConfig {
     /// separate channel.
     pub channels: Option<Vec<f32>>,
     pub wpm: f32,
-    /// Use the FFT channelizer instead of a Goertzel bank. Required for
-    /// `scan`.
+    /// Use the FFT channelizer instead of a Goertzel bank for fixed-tone
+    /// decoding. Ignored in `scan` mode, which always decodes each
+    /// detected station through its own Goertzel filter.
     pub fft: bool,
-    /// Auto-detect occupied bins during the first `scan_duration` seconds.
+    /// Skim continuously: re-detect stations every `scan_duration`
+    /// seconds, opening and closing channels as they come and go.
     pub scan: bool,
     pub scan_duration: f32,
     pub scan_snr_db: f32,
@@ -53,6 +55,8 @@ pub struct ServerConfig {
     pub scan_nms_radius: usize,
     pub scan_min_freq: f32,
     pub scan_max_freq: f32,
+    /// Seconds a skimmed channel may go undetected before it closes.
+    pub channel_timeout: f32,
     /// Directory containing the built `SvelteKit` assets (a SPA with an
     /// `index.html` at its root). `None` serves the embedded stub page.
     pub web_dir: Option<PathBuf>,
@@ -83,9 +87,6 @@ pub struct AppState {
 /// Returns an error if the input WAV cannot be opened or decoded, or if
 /// the configuration rejects (e.g. `scan` without `fft`).
 pub fn build_app(cfg: &ServerConfig) -> Result<Router, BoxError> {
-    if cfg.scan && !cfg.fft {
-        return Err("--scan requires --fft".into());
-    }
     let (samples, sample_rate) = pipeline::load(&cfg.input)?;
     let pipeline_cfg = pipeline::PipelineConfig {
         tones: cfg.tones(),
@@ -98,6 +99,7 @@ pub fn build_app(cfg: &ServerConfig) -> Result<Router, BoxError> {
         scan_nms_radius: cfg.scan_nms_radius,
         scan_min_freq: cfg.scan_min_freq,
         scan_max_freq: cfg.scan_max_freq,
+        channel_timeout: cfg.channel_timeout,
     };
     let state = AppState {
         input: cfg.input.display().to_string(),

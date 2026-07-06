@@ -8,6 +8,8 @@
 		freqHz: number;
 		wpm: number;
 		tokens: Token[];
+		/** Retired by the skimmer (channel_close); text stays visible. */
+		closed: boolean;
 	}
 
 	let connectionStatus = $state<'connecting' | 'connected' | 'disconnected' | 'error' | 'done'>(
@@ -28,6 +30,10 @@
 		Object.entries(channels)
 			.map(([id, c]) => ({ id: Number(id), ...c }))
 			.sort((a, b) => a.id - b.id)
+	);
+	// Markers drawn over the waterfall — live channels only.
+	const liveMarkers = $derived(
+		channelList.filter((c) => !c.closed).map((c) => ({ id: c.id, freqHz: c.freqHz }))
 	);
 
 	onMount(() => {
@@ -69,8 +75,13 @@
 				}
 				break;
 			case 'channel_open':
-				channels[ev.id] = { freqHz: ev.freq_hz, wpm: ev.wpm, tokens: [] };
+				channels[ev.id] = { freqHz: ev.freq_hz, wpm: ev.wpm, tokens: [], closed: false };
 				break;
+			case 'channel_close': {
+				const c = channels[ev.id];
+				if (c) c.closed = true;
+				break;
+			}
 			case 'char':
 				channels[ev.channel]?.tokens.push({ kind: 'char', value: ev.ch });
 				break;
@@ -119,12 +130,24 @@
 	{/if}
 	{#if spectrumFrame}
 		<div class="waterfall-wrap">
-			<Waterfall frame={spectrumFrame} fMin={spectrumFMin} fMax={spectrumFMax} />
+			<Waterfall
+				frame={spectrumFrame}
+				fMin={spectrumFMin}
+				fMax={spectrumFMax}
+				markers={liveMarkers}
+			/>
 		</div>
 	{/if}
 	<div class="channels">
 		{#each channelList as ch (ch.id)}
-			<Channel id={ch.id} freqHz={ch.freqHz} wpm={ch.wpm} tokens={ch.tokens} {done} />
+			<Channel
+				id={ch.id}
+				freqHz={ch.freqHz}
+				wpm={ch.wpm}
+				tokens={ch.tokens}
+				closed={ch.closed}
+				{done}
+			/>
 		{/each}
 		{#if done && channelList.length === 0}
 			<div class="empty">no channels</div>

@@ -1,13 +1,27 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 
+	interface Marker {
+		id: number;
+		freqHz: number;
+	}
+
 	interface Props {
 		frame: Uint8Array | null;
 		fMin: number;
 		fMax: number;
+		/** Live decode channels, drawn as ticks over the display. */
+		markers?: Marker[];
 	}
 
-	let { frame, fMin, fMax }: Props = $props();
+	let { frame, fMin, fMax, markers = [] }: Props = $props();
+
+	// Horizontal position of a frequency as a 0..100% offset.
+	function toPercent(freqHz: number): number {
+		const span = fMax - fMin;
+		if (span <= 0) return 0;
+		return Math.min(100, Math.max(0, ((freqHz - fMin) / span) * 100));
+	}
 
 	const HEIGHT = 256;
 	let canvas: HTMLCanvasElement;
@@ -55,7 +69,14 @@
 </script>
 
 <div class="waterfall">
-	<canvas bind:this={canvas}></canvas>
+	<div class="display">
+		<canvas bind:this={canvas}></canvas>
+		{#each markers as m (m.id)}
+			<div class="marker" style:left="{toPercent(m.freqHz)}%">
+				<span class="tag">ch {m.id} · {m.freqHz.toFixed(0)}</span>
+			</div>
+		{/each}
+	</div>
 	<div class="axis">
 		<span>{fMin.toFixed(0)} Hz</span>
 		<span>{fMax.toFixed(0)} Hz</span>
@@ -68,6 +89,9 @@
 		flex-direction: column;
 		gap: 0.25rem;
 	}
+	.display {
+		position: relative;
+	}
 	canvas {
 		width: 100%;
 		height: 256px;
@@ -76,6 +100,26 @@
 		border: 1px solid var(--panel-border);
 		border-radius: 6px;
 		display: block;
+	}
+	.marker {
+		position: absolute;
+		top: 0;
+		bottom: 0;
+		width: 0;
+		border-left: 1px dashed color-mix(in srgb, var(--accent) 65%, transparent);
+		pointer-events: none;
+	}
+	.tag {
+		position: absolute;
+		top: 2px;
+		left: 3px;
+		font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+		font-size: 0.65rem;
+		color: var(--accent);
+		background: rgba(0, 0, 0, 0.65);
+		padding: 0 3px;
+		border-radius: 3px;
+		white-space: nowrap;
 	}
 	.axis {
 		display: flex;

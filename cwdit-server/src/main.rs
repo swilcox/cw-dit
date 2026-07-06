@@ -39,22 +39,24 @@ struct Args {
     wpm: f32,
 
     /// Use the FFT channelizer under the hood instead of a bank of
-    /// Goertzels. Required for --scan.
+    /// Goertzels for fixed-tone decoding. Ignored with --scan.
     #[arg(long, default_value_t = false)]
     fft: bool,
 
-    /// Scan the band for occupied bins instead of decoding fixed tones.
-    /// Requires --fft and conflicts with --channels.
-    #[arg(long, default_value_t = false, requires = "fft", conflicts_with = "channels")]
+    /// Skim continuously: re-detect stations every --scan-duration
+    /// seconds, opening and closing channels as they come and go.
+    /// Conflicts with --channels.
+    #[arg(long, default_value_t = false, conflicts_with = "channels")]
     scan: bool,
 
-    /// Calibration window for --scan, in seconds.
+    /// Calibration interval for --scan, in seconds. Detection re-runs
+    /// every interval.
     #[arg(long, default_value_t = 3.0, requires = "scan")]
     scan_duration: f32,
 
-    /// Minimum peak-to-noise-floor SNR (dB) required to flag a bin as
-    /// occupied during --scan.
-    #[arg(long, default_value_t = 12.0, requires = "scan")]
+    /// Minimum peak SNR (dB) against the local noise floor required to
+    /// flag a bin as occupied during --scan.
+    #[arg(long, default_value_t = 8.0, requires = "scan")]
     scan_snr_db: f32,
 
     /// Cap on the number of signals returned by --scan.
@@ -72,6 +74,10 @@ struct Args {
     /// Upper frequency bound (Hz) for --scan.
     #[arg(long, default_value_t = 3000.0, requires = "scan")]
     scan_max_freq: f32,
+
+    /// Seconds a skimmed channel may go undetected before it is closed.
+    #[arg(long, default_value_t = 30.0, requires = "scan")]
+    channel_timeout: f32,
 
     /// Listen address (host:port).
     #[arg(long, default_value = "127.0.0.1:3000")]
@@ -111,6 +117,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             scan_nms_radius: args.scan_nms_radius,
             scan_min_freq: args.scan_min_freq,
             scan_max_freq: args.scan_max_freq,
+            channel_timeout: args.channel_timeout,
             web_dir,
             pace_factor: args.pace_factor,
         },

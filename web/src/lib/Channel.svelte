@@ -7,15 +7,17 @@
 		wpm: number;
 		tokens: Token[];
 		done: boolean;
+		/** Retired by the skimmer; text stays, card dims. */
+		closed?: boolean;
 	}
 
-	let { id, freqHz, wpm, tokens, done }: Props = $props();
+	let { id, freqHz, wpm, tokens, done, closed = false }: Props = $props();
 </script>
 
-<div class="channel" class:done>
+<div class="channel" class:done class:closed>
 	<header>
 		<span class="label">ch {id} · {freqHz.toFixed(1)} Hz</span>
-		<span class="wpm">{wpm.toFixed(1)} WPM</span>
+		<span class="wpm">{closed ? 'closed · ' : ''}{wpm.toFixed(1)} WPM</span>
 	</header>
 	<div class="text">
 		{#each tokens as tok, i (i)}
@@ -35,6 +37,9 @@
 	}
 	.channel.done {
 		border-color: var(--accent);
+	}
+	.channel.closed {
+		opacity: 0.55;
 	}
 	header {
 		display: flex;
