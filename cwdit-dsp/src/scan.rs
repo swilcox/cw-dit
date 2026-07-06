@@ -119,6 +119,36 @@ impl BinStats {
         var.max(0.0).sqrt() as f32
     }
 
+    /// Signed fractional-bin offset of the true spectral peak around
+    /// `bin`, from parabolic interpolation over the log-magnitude peak
+    /// statistic of the bin and its immediate neighbours. Clamped to
+    /// ±0.5 bin; returns 0.0 at the spectrum edges or when the
+    /// neighbourhood isn't actually peaked at `bin`.
+    ///
+    /// Detection quantises each signal to its strongest bin; a decoder
+    /// that can tune to arbitrary frequencies (e.g. a Goertzel bank)
+    /// should add this offset so its filter sits on the signal rather
+    /// than the bin grid.
+    ///
+    /// # Panics
+    /// Panics if `bin >= bin_count()`.
+    #[must_use]
+    pub fn peak_offset(&self, bin: usize) -> f32 {
+        assert!(bin < self.n_bins, "bin index out of range");
+        if bin == 0 || bin + 1 >= self.n_bins {
+            return 0.0;
+        }
+        let l = self.peak[bin - 1].max(f32::MIN_POSITIVE).ln();
+        let c = self.peak[bin].max(f32::MIN_POSITIVE).ln();
+        let r = self.peak[bin + 1].max(f32::MIN_POSITIVE).ln();
+        let denom = l - 2.0 * c + r;
+        if denom >= 0.0 {
+            // Flat or valley-shaped neighbourhood — no peak to refine.
+            return 0.0;
+        }
+        (0.5 * (l - r) / denom).clamp(-0.5, 0.5)
+    }
+
     /// Detect occupied bins using `cfg`. Returns bin indices sorted in
     /// ascending order.
     #[must_use]
@@ -129,22 +159,37 @@ impl BinStats {
             return Vec::new();
         }
 
-        // Noise-floor estimators: median across the search range.
+        // Noise-floor estimators: median across the search range, or a
+        // sliding local median when `floor_radius` is set. The local form
+        // matters for shaped passbands (e.g. a receiver's audio filter):
+        // against a single global floor, every bin inside an elevated
+        // noise band looks "loud", and the quiet region beyond the filter
+        // edge drags the global median down further still.
         let peaks: Vec<f32> = (min_bin..max_bin).map(|b| self.peak(b)).collect();
         let stds: Vec<f32> = (min_bin..max_bin).map(|b| self.stddev(b)).collect();
-        let noise_peak = median(&peaks);
-        let noise_std = median(&stds);
+        let floor_at = |values: &[f32], i: usize| -> f32 {
+            match cfg.floor_radius {
+                None => median(values),
+                Some(r) => {
+                    let lo = i.saturating_sub(r);
+                    let hi = (i + r + 1).min(values.len());
+                    median(&values[lo..hi])
+                }
+            }
+        };
 
-        let peak_thresh = noise_peak * 10_f32.powf(cfg.peak_snr_db / 20.0);
-        let std_thresh = noise_std * cfg.variance_ratio;
+        let snr_ratio = 10_f32.powf(cfg.peak_snr_db / 20.0);
 
         // Candidates: (peak, bin) for every bin in range that clears both
-        // thresholds.
+        // thresholds against its own noise floor.
         let mut candidates: Vec<(f32, usize)> = (min_bin..max_bin)
             .filter_map(|b| {
+                let i = b - min_bin;
                 let p = self.peak(b);
                 let s = self.stddev(b);
-                (p > peak_thresh && s > std_thresh).then_some((p, b))
+                let clears = p > floor_at(&peaks, i) * snr_ratio
+                    && s > floor_at(&stds, i) * cfg.variance_ratio;
+                clears.then_some((p, b))
             })
             .collect();
         // Strongest first so NMS always keeps the dominant peak.
@@ -208,6 +253,12 @@ pub struct ScanConfig {
     pub dominance_db: f32,
     /// Cap on the number of bins returned.
     pub max_channels: usize,
+    /// Radius (bins) of the sliding window used to estimate each bin's
+    /// noise floor. `None` uses one global median over the whole search
+    /// range — only appropriate when the noise spectrum is flat. Choose a
+    /// radius wide enough that most window bins are unoccupied, but
+    /// narrower than the passband shaping you need to track.
+    pub floor_radius: Option<usize>,
     /// First bin to consider (inclusive). Use this to skip DC / very-low
     /// frequencies where hum and audio DC offset live.
     pub min_bin: usize,
@@ -224,10 +275,111 @@ impl Default for ScanConfig {
             dominance_radius: 16,
             dominance_db: 20.0,
             max_channels: 32,
+            floor_radius: None,
             min_bin: 1, // always skip DC
             max_bin: None,
         }
     }
+}
+
+/// Drop detection candidates whose envelope keys in lockstep with a much
+/// stronger neighbour — spurs and key-click sidebands of that signal, not
+/// stations. `histories[i]` is the recorded envelope of `candidates[i]`
+/// over the calibration interval (all equal length). A candidate within
+/// `ghost_radius_bins` of a kept candidate at least `min_parent_db`
+/// stronger is dropped when its envelope correlates above
+/// `corr_threshold` with the parent's envelope (spurs follow the keying)
+/// *or* with the parent envelope's rectified derivative (key clicks light
+/// up at the keying transitions). Returns the surviving bins in ascending
+/// order plus the number of ghosts dropped.
+///
+/// # Panics
+/// Panics if `histories.len() != candidates.len()`.
+#[must_use]
+pub fn suppress_correlated_ghosts(
+    candidates: &[usize],
+    histories: &[Vec<f32>],
+    stats: &BinStats,
+    ghost_radius_bins: usize,
+    min_parent_db: f32,
+    corr_threshold: f32,
+) -> (Vec<usize>, usize) {
+    assert_eq!(
+        histories.len(),
+        candidates.len(),
+        "one history per candidate"
+    );
+    let parent_ratio = 10_f32.powf(min_parent_db / 20.0);
+    let mut order: Vec<usize> = (0..candidates.len()).collect();
+    order.sort_by(|&a, &b| {
+        stats
+            .peak(candidates[b])
+            .partial_cmp(&stats.peak(candidates[a]))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut kept: Vec<usize> = Vec::new();
+    for i in order {
+        let bin = candidates[i];
+        let is_ghost = kept.iter().any(|&k| {
+            let parent = candidates[k];
+            if parent.abs_diff(bin) > ghost_radius_bins
+                || stats.peak(parent) <= stats.peak(bin) * parent_ratio
+                || histories[i].len() < 2
+            {
+                return false;
+            }
+            let edges: Vec<f32> = histories[k]
+                .windows(2)
+                .map(|w| (w[1] - w[0]).abs())
+                .collect();
+            envelope_correlation(&histories[k], &histories[i]) > corr_threshold
+                || envelope_correlation(&edges, &histories[i][1..]) > corr_threshold
+        });
+        if !is_ghost {
+            kept.push(i);
+        }
+    }
+    let ghosts = candidates.len() - kept.len();
+    let mut bins: Vec<usize> = kept.into_iter().map(|i| candidates[i]).collect();
+    bins.sort_unstable();
+    (bins, ghosts)
+}
+
+/// Pearson correlation of two equal-length envelope streams, in [-1, 1].
+/// Returns 0.0 when either stream is constant (zero variance) or empty.
+///
+/// Used to tell a keying-click sideband from a genuine neighbouring
+/// station: a sideband's envelope keys in lockstep with its parent
+/// carrier (correlation near +1), while an independent station — even the
+/// other side of the same QSO — keys on its own schedule (correlation
+/// near zero, or negative for stations that alternate).
+///
+/// # Panics
+/// Panics if the slices differ in length.
+#[must_use]
+pub fn envelope_correlation(a: &[f32], b: &[f32]) -> f32 {
+    assert_eq!(a.len(), b.len(), "envelope streams must be equal length");
+    let n = a.len();
+    if n == 0 {
+        return 0.0;
+    }
+    let nf = n as f64;
+    let mean_a = a.iter().map(|&x| f64::from(x)).sum::<f64>() / nf;
+    let mean_b = b.iter().map(|&x| f64::from(x)).sum::<f64>() / nf;
+    let mut cov = 0.0_f64;
+    let mut var_a = 0.0_f64;
+    let mut var_b = 0.0_f64;
+    for (&x, &y) in a.iter().zip(b) {
+        let dx = f64::from(x) - mean_a;
+        let dy = f64::from(y) - mean_b;
+        cov += dx * dy;
+        var_a += dx * dx;
+        var_b += dy * dy;
+    }
+    if var_a <= 0.0 || var_b <= 0.0 {
+        return 0.0;
+    }
+    (cov / (var_a.sqrt() * var_b.sqrt())) as f32
 }
 
 fn median(values: &[f32]) -> f32 {
@@ -426,6 +578,120 @@ mod tests {
         });
         let picked = stats.detect(&ScanConfig::default());
         assert_eq!(picked, vec![40, 80]);
+    }
+
+    #[test]
+    fn ghost_suppression_drops_spurs_and_clicks_keeps_stations() {
+        // Candidate 0: strong parent at bin 40. Candidate 1: spur at bin
+        // 45 following the parent's envelope, 20 dB down. Candidate 2:
+        // click sideband at bin 48 lighting up at the parent's keying
+        // transitions. Candidate 3: independent station at bin 60, also
+        // 20 dB down, keying its own alternate pattern.
+        let n = 400;
+        let key = |i: usize| (i / 20).is_multiple_of(2);
+        let mut stats = BinStats::new(128);
+        let mut hist: Vec<Vec<f32>> = vec![Vec::new(); 4];
+        let mut frame = vec![0.0_f32; 128];
+        let mut prev_parent = 0.0_f32;
+        for i in 0..n {
+            let parent = if key(i) { 1.0 } else { 0.01 };
+            let edge = (parent - prev_parent).abs();
+            prev_parent = parent;
+            let station = if key(i) { 0.01 } else { 0.1 };
+            frame[40] = parent;
+            frame[45] = 0.1 * parent;
+            frame[48] = 0.2 * edge + 0.005;
+            frame[60] = station;
+            stats.observe(&frame);
+            for (h, &b) in hist.iter_mut().zip(&[40usize, 45, 48, 60]) {
+                h.push(frame[b]);
+            }
+        }
+        let (kept, ghosts) =
+            suppress_correlated_ghosts(&[40, 45, 48, 60], &hist, &stats, 32, 6.0, 0.5);
+        assert_eq!(kept, vec![40, 60], "spur and click must drop");
+        assert_eq!(ghosts, 2);
+    }
+
+    #[test]
+    fn envelope_correlation_separates_lockstep_from_independent() {
+        // Parent carrier keying pattern and its sideband (same pattern,
+        // scaled + noisy) vs an independent station keying alternately.
+        let n = 400;
+        let parent: Vec<f32> = (0..n)
+            .map(|i| if (i / 20) % 2 == 0 { 1.0 } else { 0.05 })
+            .collect();
+        let sideband: Vec<f32> = parent
+            .iter()
+            .enumerate()
+            .map(|(i, &p)| 0.1 * p + 0.01 * rng(i as u64))
+            .collect();
+        let alternate: Vec<f32> = (0..n)
+            .map(|i| if (i / 20) % 2 == 1 { 0.3 } else { 0.02 })
+            .collect();
+        assert!(envelope_correlation(&parent, &sideband) > 0.9);
+        assert!(envelope_correlation(&parent, &alternate) < -0.5);
+        assert!(envelope_correlation(&parent, &vec![0.5; n]).abs() < f32::EPSILON);
+        assert!(envelope_correlation(&[], &[]).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn local_floor_rejects_shaped_passband_noise() {
+        // A receiver-shaped spectrum: elevated keyed-ish noise across bins
+        // 20..=60 (audio passband), quiet beyond, one real keyed signal at
+        // bin 40 well above the plateau. A global median floor sits on the
+        // quiet region and flags the entire plateau; a local floor tracks
+        // the plateau and keeps only the real signal.
+        let stats = stats_from(256, 400, |frame, bin| {
+            let noise = rng((frame as u64) * 131 + bin as u64);
+            let on = (frame / 20) % 2 == 0;
+            match bin {
+                40 if on => 3.0 + 0.3 * noise,
+                20..=60 => 0.3 * noise, // elevated, fluctuating band
+                _ => 0.02 * noise,
+            }
+        });
+        let global = stats.detect(&ScanConfig::default());
+        assert!(
+            global.len() > 1,
+            "expected the global floor to over-detect the plateau, got {global:?}"
+        );
+        let local = stats.detect(&ScanConfig {
+            floor_radius: Some(12),
+            ..ScanConfig::default()
+        });
+        assert_eq!(local, vec![40], "local floor should keep only the real signal");
+    }
+
+    #[test]
+    fn peak_offset_recovers_off_grid_tone() {
+        // A tone between bins 50 and 51, closer to 50 (offset +0.3),
+        // shaped like a sampled window mainlobe: neighbour magnitudes
+        // fall off with distance from the true peak.
+        let mainlobe = |dist: f32| (-dist * dist).exp();
+        let stats = stats_from(128, 50, |_, bin| match bin {
+            49..=52 => mainlobe(bin as f32 - 50.3),
+            _ => 0.01,
+        });
+        let off = stats.peak_offset(50);
+        assert!(
+            (off - 0.3).abs() < 0.05,
+            "expected offset ~0.3, got {off}"
+        );
+    }
+
+    #[test]
+    fn peak_offset_is_zero_on_centred_tone_and_edges() {
+        let mainlobe = |dist: f32| (-dist * dist).exp();
+        let stats = stats_from(128, 50, |_, bin| match bin {
+            59..=61 => mainlobe(bin as f32 - 60.0),
+            _ => 0.01,
+        });
+        assert!(stats.peak_offset(60).abs() < 1e-3);
+        assert!(stats.peak_offset(0).abs() < f32::EPSILON);
+        assert!(stats.peak_offset(127).abs() < f32::EPSILON);
+        // Flat noise floor: no peak shape, no refinement.
+        assert!(stats.peak_offset(100).abs() < f32::EPSILON);
     }
 
     #[test]
