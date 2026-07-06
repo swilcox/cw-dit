@@ -15,8 +15,9 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use cwdit_dsp::{
-    BinStats, Debouncer, FftChannelizer, GoertzelBank, IqChannelizer, MovingAverage,
-    RunLengthEncoder, ScanConfig, Threshold,
+    BinStats, ChannelTracker, Debouncer, Detector, DetectorConfig, FftChannelizer, Goertzel,
+    GoertzelBank, IqChannelizer, MovingAverage, RunLengthEncoder, ScanConfig, Threshold,
+    TrackerConfig, skim, suppress_correlated_ghosts,
 };
 use cwdit_morse::{BootstrapDecoder, Decoded, TimingEstimator};
 use cwdit_source::{AudioSource, Source, WavSource};
@@ -25,22 +26,16 @@ use rustfft::num_complex::Complex32;
 #[cfg(feature = "soapy")]
 use cwdit_source::SoapySource;
 
-/// Minimum Goertzel block length, regardless of sample rate / tone.
-const MIN_BLOCK_LEN: u32 = 16;
+// Window sizing, detection thresholds, and ghost-filter policy live in
+// `cwdit_dsp::skim`, shared with the server front-end.
 
-/// Default Goertzel block length multiplier: block spans roughly this many
-/// cycles of the target tone.
-const DEFAULT_BLOCK_CYCLES: f32 = 4.0;
+/// A detection this close to a live channel refreshes it instead of
+/// spawning a duplicate. Covers bin quantisation and fade-induced jitter
+/// while staying below any station spacing worth separating.
+const SKIM_MATCH_RADIUS_HZ: f32 = 25.0;
 
 /// Default absolute-envelope floor for the slicer in multi-channel mode.
 const DEFAULT_MULTI_ON_FLOOR: f32 = 0.08;
-
-/// Auto-hop target: this many envelope samples per CW dit.
-const TARGET_SAMPLES_PER_DIT: f32 = 10.0;
-
-/// Audio-rate FFT auto-size limits.
-const MIN_AUTO_FFT_SIZE: usize = 128;
-const MAX_AUTO_FFT_SIZE: usize = 4096;
 
 /// IQ-rate FFT auto-size targets bin spacing rather than dit width: at SDR
 /// rates the dit-width rule would pick FFTs too coarse to resolve adjacent
@@ -149,7 +144,8 @@ struct Args {
     fixed_timing: bool,
 
     /// Use the FFT channelizer under the hood instead of a Goertzel bank.
-    /// Implied by --sdr and --scan.
+    /// Implied by --sdr. With --scan it selects the one-shot
+    /// calibrate-then-decode flow instead of continuous skimming.
     #[arg(long, default_value_t = false)]
     fft: bool,
 
@@ -162,18 +158,33 @@ struct Args {
     hop: Option<usize>,
 
     /// Scan the band for occupied bins instead of decoding fixed tones.
-    /// Requires the FFT path. With --sdr the scan covers the full sampled
-    /// passband; with audio it covers --scan-min-freq..--scan-max-freq.
+    /// Detection runs on a long-window FFT; the detected tones are then
+    /// decoded by a Goertzel bank tuned to each signal (pass --fft to
+    /// decode via the FFT channelizer instead). With --sdr the scan covers
+    /// the full sampled passband; with audio it covers
+    /// --scan-min-freq..--scan-max-freq.
     #[arg(long, default_value_t = false, conflicts_with = "channels")]
     scan: bool,
 
-    /// Calibration window for --scan, in seconds.
+    /// Calibration interval for --scan, in seconds. On the audio path
+    /// detection re-runs every interval, spawning and retiring decode
+    /// channels as stations come and go; with --sdr or --fft it is a
+    /// one-shot window.
     #[arg(long, default_value_t = 3.0, requires = "scan")]
     scan_duration: f32,
 
+    /// Seconds a skimmed channel may go undetected before it is closed
+    /// (audio --scan only). Generous by default: the quiet side of a QSO
+    /// stays silent for its partner's whole over.
+    #[arg(long, default_value_t = 30.0, requires = "scan")]
+    channel_timeout: f32,
+
     /// Minimum peak-to-noise-floor SNR (dB) required to flag a bin as
-    /// occupied during --scan.
-    #[arg(long, default_value_t = 12.0, requires = "scan")]
+    /// occupied during --scan. Measured against a *local* (sliding-median)
+    /// noise floor, which tracks passband shaping honestly — so real
+    /// signals clear it with smaller margins than against the old global
+    /// floor.
+    #[arg(long, default_value_t = 8.0, requires = "scan")]
     scan_snr_db: f32,
 
     /// Cap on the number of signals returned by --scan.
@@ -203,26 +214,33 @@ impl Args {
     fn resolved_block_len(&self, sample_rate: f32, tones: &[f32]) -> u32 {
         self.block_len.unwrap_or_else(|| {
             let lowest_tone = tones.iter().copied().fold(f32::INFINITY, f32::min);
-            let raw = (DEFAULT_BLOCK_CYCLES * sample_rate / lowest_tone).round() as u32;
-            raw.max(MIN_BLOCK_LEN)
+            skim::decode_block_len(sample_rate, self.wpm, lowest_tone)
         })
     }
 
-    fn resolved_on_floor(&self, multi_channel: bool) -> f32 {
-        self.on_floor.unwrap_or(if multi_channel {
-            DEFAULT_MULTI_ON_FLOOR
-        } else {
-            0.0
-        })
+    /// `guard` is true for blind multi-channel lists (`--channels` with
+    /// more than one entry): those get the absolute floor so a channel
+    /// parked on an empty frequency doesn't decode noise. Single-tone and
+    /// scan-created channels run un-floored.
+    fn resolved_on_floor(&self, guard: bool) -> f32 {
+        self.on_floor
+            .unwrap_or(if guard { DEFAULT_MULTI_ON_FLOOR } else { 0.0 })
     }
 
     fn resolved_fft_size(&self, sample_rate: f32) -> usize {
         self.fft_size
-            .unwrap_or_else(|| auto_fft_size(sample_rate, self.wpm))
+            .unwrap_or_else(|| skim::decode_fft_size(sample_rate, self.wpm))
+    }
+
+    /// FFT size for the `--scan` calibration channelizer. An explicit
+    /// `--fft-size` overrides both this and the decode window.
+    fn resolved_scan_fft_size(&self, sample_rate: f32) -> usize {
+        self.fft_size
+            .unwrap_or_else(|| skim::detect_fft_size(sample_rate, self.wpm))
     }
 
     fn resolved_hop(&self, sample_rate: f32, fft_size: usize) -> usize {
-        let auto = auto_hop(sample_rate, self.wpm, fft_size);
+        let auto = skim::auto_hop(sample_rate, self.wpm, fft_size);
         let raw = self.hop.unwrap_or(auto);
         raw.clamp(1, fft_size / 2)
     }
@@ -240,24 +258,13 @@ impl Args {
         raw.clamp(1, fft_size / 2)
     }
 
+    /// Whether the *decode* backend must be the FFT channelizer. `--scan`
+    /// no longer forces it: scan uses an FFT internally for detection but
+    /// hands the detected tones to a Goertzel bank, which sits exactly on
+    /// each signal instead of the bin grid.
     fn force_fft(&self) -> bool {
-        self.fft || self.scan || self.sdr.is_some()
+        self.fft || self.sdr.is_some()
     }
-}
-
-fn auto_fft_size(sample_rate: f32, wpm: f32) -> usize {
-    let dit_s = 1.2 / wpm;
-    let raw = sample_rate * dit_s;
-    let cap = if raw >= 1.0 { raw as usize } else { 1 };
-    let pow2 = prev_pow2(cap).max(MIN_AUTO_FFT_SIZE);
-    pow2.min(MAX_AUTO_FFT_SIZE)
-}
-
-fn auto_hop(sample_rate: f32, wpm: f32, fft_size: usize) -> usize {
-    let dit_s = 1.2 / wpm;
-    let raw = (sample_rate * dit_s / TARGET_SAMPLES_PER_DIT).floor();
-    let hop = if raw >= 1.0 { raw as usize } else { 1 };
-    hop.clamp(1, fft_size / 2)
 }
 
 /// Pick an FFT size whose bin spacing is `<= TARGET_IQ_BIN_SPACING_HZ`,
@@ -274,14 +281,6 @@ fn auto_iq_fft_size(sample_rate: f32) -> usize {
 fn auto_iq_hop(sample_rate: f32) -> usize {
     let raw = (sample_rate / TARGET_IQ_ENVELOPE_RATE_HZ).round() as usize;
     raw.max(1)
-}
-
-fn prev_pow2(n: usize) -> usize {
-    if n < 2 {
-        1
-    } else {
-        1usize << (usize::BITS - 1 - n.leading_zeros())
-    }
 }
 
 #[cfg(feature = "soapy")]
@@ -360,10 +359,17 @@ fn run_sdr(args: &Args, sdr_args: &str) -> Result<(), Box<dyn Error>> {
 }
 
 fn decode_real<S: Source<Sample = f32>>(args: &Args, mut source: S) -> Result<(), Box<dyn Error>> {
+    // Audio-path scanning skims continuously: detection re-runs every
+    // interval and channels come and go. With --fft the one-shot
+    // calibrate-then-decode flow below is kept (fixed FFT decode bins
+    // can't follow a changing channel list).
+    if args.scan && !args.fft {
+        return skim_audio(args, source);
+    }
     let sample_rate = source.sample_rate();
 
     let (tones, prefetch) = if args.scan {
-        let fft_size = args.resolved_fft_size(sample_rate);
+        let fft_size = args.resolved_scan_fft_size(sample_rate);
         let hop = args.resolved_hop(sample_rate, fft_size);
         let mut channelizer = FftChannelizer::new(fft_size, hop, sample_rate);
         let min_freq = args.scan_min_freq.unwrap_or(300.0);
@@ -446,7 +452,11 @@ where
     let env_rate = backend.envelope_sample_rate();
     let labels = backend.labels();
     let multi = tones.len() > 1;
-    let on_floor = args.resolved_on_floor(multi);
+    // The absolute floor guards *blind* channel lists (--channels) against
+    // decoding raw noise. Scan-created channels already cleared the scan's
+    // SNR gate, so they run un-floored — a fixed floor is exactly what
+    // silences weak-but-real signals.
+    let on_floor = args.resolved_on_floor(multi && !args.scan);
 
     let mut chains: Vec<ChannelChain> = tones
         .iter()
@@ -557,6 +567,189 @@ fn feed_sample<T: Copy + Default>(
     Ok(())
 }
 
+/// One live skimmer channel: a Goertzel filter on the detected tone
+/// feeding its own decode chain, with per-word buffered output.
+struct LiveChannel {
+    label: String,
+    filter: Goertzel,
+    chain: ChannelChain,
+    pending: String,
+}
+
+impl LiveChannel {
+    fn new(tone: f32, sample_rate: f32, block_len: u32, env_rate: f32, args: &Args) -> Self {
+        Self {
+            label: format!("{tone:>6.0} Hz"),
+            filter: Goertzel::new(tone, sample_rate, block_len),
+            chain: ChannelChain::new(
+                env_rate,
+                args.wpm,
+                args.peak_half_life,
+                args.min_peak,
+                // Skim channels cleared the scan's SNR gate; see
+                // resolved_on_floor.
+                args.resolved_on_floor(false),
+                args.snr_gate,
+                !args.fixed_timing,
+            ),
+            pending: String::new(),
+        }
+    }
+
+    fn feed<W: Write + ?Sized>(&mut self, sample: f32, out: &mut W) -> io::Result<()> {
+        if let Some(env) = self.filter.push(sample) {
+            for ev in self.chain.feed_envelope(env) {
+                write_multi_event(out, &self.label, &mut self.pending, ev)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Flush everything and print the channel summary line; `marker` is
+    /// `(closed)` for a reaped channel, `(full)` at end of input.
+    fn close<W: Write + ?Sized>(
+        &mut self,
+        out: &mut W,
+        env_rate: f32,
+        marker: &str,
+    ) -> io::Result<()> {
+        for ev in self.chain.finish() {
+            write_multi_event(out, &self.label, &mut self.pending, ev)?;
+        }
+        if !self.pending.is_empty() {
+            writeln!(out, "[{}] {}", self.label, self.pending)?;
+            self.pending.clear();
+        }
+        let wpm = self.chain.decoder.timing().wpm(env_rate);
+        writeln!(out, "[{}, {wpm:>4.1} WPM] {marker} {}", self.label, self.chain.text)
+    }
+}
+
+/// Continuous audio-path skimmer: a [`Detector`] runs per-interval
+/// detection, a [`ChannelTracker`] decides lifecycle, and [`LiveChannel`]s
+/// decode. A newly spawned channel replays the interval that discovered
+/// it, so its first transmission is decoded from the top.
+struct Skimmer<'a> {
+    args: &'a Args,
+    detector: Detector,
+    tracker: ChannelTracker,
+    channels: Vec<LiveChannel>,
+    sample_rate: f32,
+    block_len: u32,
+    env_rate: f32,
+    total_samples: u64,
+}
+
+impl Skimmer<'_> {
+    fn new(args: &Args, sample_rate: f32) -> Skimmer<'_> {
+        let fft_size = args.resolved_scan_fft_size(sample_rate);
+        let min_freq = args.scan_min_freq.unwrap_or(300.0);
+        let detector_cfg = DetectorConfig {
+            fft_size,
+            hop: args.resolved_hop(sample_rate, fft_size),
+            min_freq_hz: min_freq,
+            max_freq_hz: args.scan_max_freq.unwrap_or(3_000.0),
+            snr_db: args.scan_snr_db,
+            nms_radius: args.scan_nms_radius,
+            max_channels: args.scan_max_channels,
+            interval_s: args.scan_duration,
+        };
+        let detector = Detector::new(&detector_cfg, sample_rate);
+        let spacing = sample_rate / fft_size as f32;
+        let block_len = args.resolved_block_len(sample_rate, &[min_freq]);
+        Skimmer {
+            args,
+            detector,
+            tracker: ChannelTracker::new(TrackerConfig {
+                match_radius_hz: SKIM_MATCH_RADIUS_HZ.max(spacing),
+                timeout_s: args.channel_timeout,
+                max_channels: args.scan_max_channels,
+            }),
+            channels: Vec::new(),
+            sample_rate,
+            block_len,
+            env_rate: sample_rate / block_len as f32,
+            total_samples: 0,
+        }
+    }
+
+    fn push_sample<W: Write + ?Sized>(&mut self, sample: f32, out: &mut W) -> io::Result<()> {
+        self.total_samples += 1;
+        for ch in &mut self.channels {
+            ch.feed(sample, out)?;
+        }
+        self.detector.push(sample);
+        if self.detector.interval_complete() {
+            self.detection_round(out)?;
+        }
+        Ok(())
+    }
+
+    fn detection_round<W: Write + ?Sized>(&mut self, out: &mut W) -> io::Result<()> {
+        let tones = self.detector.detect();
+        let now_s = self.total_samples as f32 / self.sample_rate;
+        let update = self.tracker.observe(now_s, &tones);
+        for &idx in &update.reaped {
+            let mut ch = self.channels.remove(idx);
+            ch.close(out, self.env_rate, "(closed)")?;
+            eprintln!(
+                "cwdit: channel - {} after {:.0} s idle",
+                ch.label.trim(),
+                self.args.channel_timeout
+            );
+        }
+        for &tone in &update.spawned {
+            eprintln!("cwdit: channel + {tone:.1} Hz");
+            let mut ch =
+                LiveChannel::new(tone, self.sample_rate, self.block_len, self.env_rate, self.args);
+            // Replay the discovery interval so the transmission that
+            // triggered detection is decoded from its start.
+            for &s in self.detector.interval_audio() {
+                ch.feed(s, out)?;
+            }
+            self.channels.push(ch);
+        }
+
+        self.detector.reset_interval();
+        Ok(())
+    }
+
+    fn finish<W: Write + ?Sized>(&mut self, out: &mut W) -> io::Result<()> {
+        for ch in &mut self.channels {
+            ch.close(out, self.env_rate, "(full)")?;
+        }
+        Ok(())
+    }
+}
+
+/// Continuous skim of an audio source; see [`Skimmer`].
+fn skim_audio<S: Source<Sample = f32>>(args: &Args, mut source: S) -> Result<(), Box<dyn Error>> {
+    let sample_rate = source.sample_rate();
+    let mut skimmer = Skimmer::new(args, sample_rate);
+    eprintln!(
+        "cwdit: skimming {:.0}–{:.0} Hz — rescan every {:.1} s, channel timeout {:.0} s",
+        args.scan_min_freq.unwrap_or(300.0),
+        args.scan_max_freq.unwrap_or(3_000.0),
+        args.scan_duration,
+        args.channel_timeout,
+    );
+
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    let mut buf = vec![0.0_f32; 4_096];
+    loop {
+        let n = source.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        for &sample in &buf[..n] {
+            skimmer.push_sample(sample, &mut out)?;
+        }
+    }
+    skimmer.finish(&mut out)?;
+    Ok(())
+}
+
 /// Detected tone centres (Hz) plus the buffered prefetch samples that fed
 /// the calibration window — replayed through the real decoder so they
 /// aren't lost.
@@ -601,18 +794,57 @@ where
         }
     }
 
+    let spacing = channelizer.bin_spacing_hz();
     let cfg = ScanConfig {
         peak_snr_db: args.scan_snr_db,
         max_channels: args.scan_max_channels,
         nms_radius: args.scan_nms_radius,
+        // Peak-ratio dominance suppression can't tell a strong signal's
+        // keying sidebands from a genuinely weaker neighbour (the other
+        // side of a QSO sits just as close and just as far down). Disable
+        // it and let the envelope-correlation ghost filter below decide.
+        dominance_db: f32::INFINITY,
+        floor_radius: Some(((skim::FLOOR_RADIUS_HZ / spacing).round() as usize).max(8)),
         min_bin: channelizer.bin_index_for(min_freq_hz).max(1),
         max_bin: Some(
             (channelizer.bin_index_for(max_freq_hz) + 1).min(channelizer.channel_count()),
         ),
         ..ScanConfig::default()
     };
-    let bins = stats.detect(&cfg);
-    let tones: Vec<f32> = bins.iter().map(|&b| channelizer.bin_frequency(b)).collect();
+    let candidates = stats.detect(&cfg);
+
+    // Second pass: replay the buffered calibration audio and record each
+    // candidate bin's envelope, then drop candidates that key in lockstep
+    // with a much stronger neighbour — click sidebands, not stations.
+    // Recording only candidate bins keeps memory flat on wide IQ scans.
+    let mut history: Vec<Vec<f32>> = vec![Vec::new(); candidates.len()];
+    for &sample in &prefetch {
+        if let Some(bins) = channelizer.push(sample) {
+            for (h, &b) in history.iter_mut().zip(&candidates) {
+                h.push(bins[b].norm());
+            }
+        }
+    }
+    let ghost_bins = ((skim::GHOST_RADIUS_HZ / spacing).round() as usize).max(1);
+    let (bins, ghosts) = suppress_correlated_ghosts(
+        &candidates,
+        &history,
+        &stats,
+        ghost_bins,
+        skim::GHOST_MIN_DB,
+        skim::GHOST_CORR,
+    );
+    if ghosts > 0 {
+        eprintln!("cwdit: scan suppressed {ghosts} correlated sideband(s)");
+    }
+
+    // Refine each detection off the bin grid: the decoder tunes a
+    // Goertzel filter to the reported frequency, so fractional-bin
+    // accuracy directly improves its SNR.
+    let tones: Vec<f32> = bins
+        .iter()
+        .map(|&b| channelizer.bin_frequency(b) + stats.peak_offset(b) * spacing)
+        .collect();
 
     if tones.is_empty() {
         eprintln!(
@@ -638,6 +870,7 @@ trait ChannelizerLike {
     fn channel_count(&self) -> usize;
     fn bin_frequency(&self, idx: usize) -> f32;
     fn bin_index_for(&self, freq_hz: f32) -> usize;
+    fn bin_spacing_hz(&self) -> f32;
     fn fft_size_hint(&self) -> usize;
 }
 
@@ -654,6 +887,9 @@ impl ChannelizerLike for FftChannelizer {
     }
     fn bin_index_for(&self, freq_hz: f32) -> usize {
         FftChannelizer::bin_index_for(self, freq_hz)
+    }
+    fn bin_spacing_hz(&self) -> f32 {
+        FftChannelizer::bin_spacing_hz(self)
     }
     fn fft_size_hint(&self) -> usize {
         FftChannelizer::fft_size(self)
@@ -673,6 +909,9 @@ impl ChannelizerLike for IqChannelizer {
     }
     fn bin_index_for(&self, freq_hz: f32) -> usize {
         IqChannelizer::bin_index_for(self, freq_hz)
+    }
+    fn bin_spacing_hz(&self) -> f32 {
+        IqChannelizer::bin_spacing_hz(self)
     }
     fn fft_size_hint(&self) -> usize {
         IqChannelizer::fft_size(self)
