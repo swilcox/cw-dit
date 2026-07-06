@@ -6,8 +6,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use base64::Engine as _;
-use cwdit_server::{ServerConfig, build_app};
-use cwdit_synth::{SynthOptions, Track, synth_to_path};
+use cwdit_server::{Input, ServerConfig, build_app, build_app_from_source};
+use cwdit_source::{Source, SourceError};
+use cwdit_synth::{SynthOptions, Track, synth_bytes, synth_to_path};
 use futures_util::StreamExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_tungstenite::tungstenite::Message;
@@ -49,7 +50,7 @@ fn write_synth_noisy(path: &Path, tracks: &[Track], sample_rate: u32, tail_silen
 
 fn base_config(input: PathBuf) -> ServerConfig {
     ServerConfig {
-        input,
+        input: Input::Wav(input),
         tone: 700.0,
         channels: None,
         wpm: 20.0,
@@ -360,6 +361,125 @@ async fn ws_scan_mode_skims_dynamic_channels_with_waterfall() {
     let f_max = out.spectrum_f_max.unwrap();
     assert!((250.0..=350.0).contains(&f_min), "f_min {f_min}");
     assert!((2900.0..=3100.0).contains(&f_max), "f_max {f_max}");
+}
+
+/// A live-style source for tests: loops a synthesised sample buffer
+/// forever, sleeping in `read` to simulate a device delivering samples at
+/// `pace` × real time.
+struct LoopingPacedSource {
+    samples: Vec<f32>,
+    pos: usize,
+    sample_rate: f32,
+    pace: f32,
+}
+
+impl Source for LoopingPacedSource {
+    type Sample = f32;
+
+    fn sample_rate(&self) -> f32 {
+        self.sample_rate
+    }
+
+    fn read(&mut self, buf: &mut [f32]) -> Result<usize, SourceError> {
+        let n = buf.len().min(512);
+        for slot in &mut buf[..n] {
+            *slot = self.samples[self.pos];
+            self.pos = (self.pos + 1) % self.samples.len();
+        }
+        std::thread::sleep(Duration::from_secs_f32(
+            n as f32 / self.sample_rate / self.pace,
+        ));
+        Ok(n)
+    }
+}
+
+/// Render tracks to an in-memory sample buffer via `cwdit-synth`.
+fn synth_samples(tracks: &[Track], sample_rate: u32, tail_silence_s: f32) -> Vec<f32> {
+    let bytes = synth_bytes(
+        tracks,
+        &SynthOptions {
+            sample_rate,
+            tail_silence_s,
+            ..SynthOptions::default()
+        },
+    )
+    .expect("synth");
+    let mut source =
+        cwdit_source::WavSource::from_reader(std::io::Cursor::new(bytes)).expect("wav");
+    let mut out = Vec::new();
+    let mut buf = vec![0.0_f32; 4_096];
+    loop {
+        let n = source.read(&mut buf).expect("read");
+        if n == 0 {
+            break;
+        }
+        out.extend_from_slice(&buf[..n]);
+    }
+    out
+}
+
+#[tokio::test]
+async fn ws_live_feed_lets_clients_join_mid_stream() {
+    // "CQ TEST" repeating forever with a 1 s silent gap, delivered by a
+    // paced source as if from a soundcard (8× real time to keep the test
+    // quick). The client connects at some arbitrary point in the loop and
+    // must lock on and decode a later repetition.
+    let samples = synth_samples(&[Track::new("CQ TEST", 25.0, 700.0)], 8_000, 1.0);
+    let source = LoopingPacedSource {
+        samples,
+        pos: 0,
+        sample_rate: 8_000.0,
+        pace: 8.0,
+    };
+
+    // `input` in the config is ignored by build_app_from_source.
+    let app = build_app_from_source(
+        &ServerConfig {
+            wpm: 25.0,
+            ..base_config(PathBuf::new())
+        },
+        "test live".to_owned(),
+        move || Ok(source),
+    )
+    .expect("build_app_from_source");
+
+    let (addr, server) = bind_app(app).await;
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        .await
+        .expect("connect");
+
+    let mut session_mode = None;
+    let mut freq_hz = None;
+    let mut text = String::new();
+    let run = async {
+        while let Some(Ok(msg)) = ws.next().await {
+            let Message::Text(raw) = msg else { continue };
+            let ev: serde_json::Value = serde_json::from_str(&raw).expect("json");
+            match ev["type"].as_str().unwrap_or("") {
+                "session" => {
+                    session_mode = ev["mode"].as_str().map(std::string::ToString::to_string);
+                }
+                "channel_open" => freq_hz = ev["freq_hz"].as_f64(),
+                "char" => text.push(ev["ch"].as_str().unwrap().chars().next().unwrap()),
+                "word_break" => text.push(' '),
+                _ => {}
+            }
+            // A mid-transmission join may garble the first repetition;
+            // any later clean copy ends the test.
+            if text.contains("CQ TEST") {
+                break;
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(20), run)
+        .await
+        .expect("timed out waiting for live decode");
+    server.abort();
+
+    assert_eq!(session_mode.as_deref(), Some("fixed"));
+    let freq = freq_hz.expect("channel_open");
+    assert!((freq - 700.0).abs() < 0.001, "freq {freq}");
+    assert!(text.contains("CQ TEST"), "decoded: {text:?}");
 }
 
 #[tokio::test]

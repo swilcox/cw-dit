@@ -1,15 +1,15 @@
 //! `cwdit-server` — Axum front-end for the cw-dit skimmer.
 //!
 //! Serves a minimal web UI at `/` and a decode-event WebSocket at `/ws`
-//! for the configured WAV input. Mirrors the subset of `cwdit-cli` flags
-//! that apply to file-based decoding.
+//! for the configured input — a WAV file or, with `--live`, a system
+//! audio input device. Mirrors the matching subset of `cwdit-cli` flags.
 
 use std::error::Error;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use clap::Parser;
-use cwdit_server::{ServerConfig, default_web_build_dir, serve};
+use cwdit_server::{Input, ServerConfig, default_web_build_dir, serve};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
@@ -21,8 +21,18 @@ use tracing_subscriber::EnvFilter;
 // Several orthogonal boolean flags (fft, scan) — mirrors cwdit-cli.
 #[allow(clippy::struct_excessive_bools)]
 struct Args {
-    /// Path to a mono PCM WAV file containing CW.
-    input: PathBuf,
+    /// Path to a mono PCM WAV file containing CW. Omit when using --live.
+    #[arg(required_unless_present = "live", conflicts_with = "live")]
+    input: Option<PathBuf>,
+
+    /// Decode live audio from the default system input device. Clients
+    /// join the stream in progress instead of replaying a file.
+    #[arg(long, default_value_t = false)]
+    live: bool,
+
+    /// Audio input device for --live (defaults to the system default).
+    #[arg(long, requires = "live")]
+    device: Option<String>,
 
     /// Target tone frequency in Hz. Ignored when --channels is given.
     #[arg(short = 't', long, default_value_t = 700.0)]
@@ -89,8 +99,9 @@ struct Args {
     #[arg(long)]
     web_dir: Option<PathBuf>,
 
-    /// Playback speed multiplier. 1.0 = real-time, 10.0 = ten times faster.
-    #[arg(long, default_value_t = 1.0)]
+    /// Playback speed multiplier for file input. 1.0 = real-time, 10.0 =
+    /// ten times faster.
+    #[arg(long, default_value_t = 1.0, conflicts_with = "live")]
     pace_factor: f32,
 }
 
@@ -102,10 +113,18 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     let args = Args::parse();
     let web_dir = args.web_dir.or_else(default_web_build_dir);
+    let input = if args.live {
+        Input::LiveAudio {
+            device: args.device,
+        }
+    } else {
+        // clap guarantees `input` is present when --live is absent.
+        Input::Wav(args.input.expect("input path"))
+    };
     serve(
         args.bind,
         &ServerConfig {
-            input: args.input,
+            input,
             tone: args.tone,
             channels: args.channels,
             wpm: args.wpm,

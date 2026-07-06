@@ -41,6 +41,15 @@ cropped to the scanned band:
 cargo run -p cwdit-server -- /tmp/recording.wav --scan --wpm 25
 ```
 
+Live audio instead of a file — feed a receiver into the soundcard and
+skim it from the browser. One capture is shared by every connected
+client; each client decodes the stream from the moment it joins
+(`--device "Name"` picks a specific input; `--pace-factor` is file-only):
+
+```sh
+cargo run -p cwdit-server -- --live --scan --wpm 25
+```
+
 For frontend hot reload run Vite separately — it proxies `/ws` to the Rust
 server automatically:
 

@@ -23,7 +23,7 @@ use cwdit_dsp::{
 use cwdit_morse::{BootstrapDecoder, Decoded, TimingEstimator};
 use cwdit_source::{Source, SourceError, WavSource};
 use serde::Serialize;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 
 /// Envelope floor used in fixed multi-channel mode to reject sidelobe
 /// leakage on blind channel lists. Scan-spawned channels run un-floored —
@@ -46,6 +46,13 @@ const SPECTRUM_TARGET_FPS: f32 = 25.0;
 const SPECTRUM_DB_FLOOR: f32 = -80.0;
 /// Upper edge of the dB range mapped to `u8` 255 in spectrum frames.
 const SPECTRUM_DB_CEILING: f32 = 0.0;
+/// Live-capture chunk length, in seconds of audio. Small enough that a
+/// freshly connected client starts decoding promptly; large enough that
+/// per-chunk overhead stays trivial.
+const CAPTURE_CHUNK_S: f32 = 0.05;
+/// Broadcast depth, in chunks (~13 s at [`CAPTURE_CHUNK_S`]), before a
+/// slow pipeline starts losing samples.
+const FEED_CAPACITY: usize = 256;
 
 /// Per-connection processing configuration. Clone-friendly (small, no IO).
 #[derive(Clone, Debug)]
@@ -166,15 +173,160 @@ pub fn load(path: &Path) -> Result<(Vec<f32>, f32), SourceError> {
     Ok((samples, sr))
 }
 
-/// Stream `samples` through a fresh decode pipeline, publishing [`Event`]s.
-/// Returns when the sample buffer is exhausted or the receiver is dropped.
+/// One batch of input samples, shared between live-feed subscribers.
+pub type Chunk = Arc<Vec<f32>>;
+
+/// Where a connection's samples come from.
+pub enum Feed {
+    /// The whole input is in memory; replay it at `pace_factor` × real
+    /// time. Every connection starts from the beginning.
+    Replay {
+        samples: Arc<Vec<f32>>,
+        pace_factor: f32,
+    },
+    /// A shared live capture (see [`spawn_capture`]); the connection
+    /// decodes the stream from "now".
+    Live { rx: broadcast::Receiver<Chunk> },
+}
+
+/// Open a live source via `open` on a dedicated capture thread and fan
+/// its samples out to every subscriber of the returned sender. The source
+/// is *created on* the thread that reads it because some sources (cpal
+/// audio streams) are not `Send`. Returns the feed alongside the source's
+/// sample rate.
+///
+/// An empty sentinel chunk marks end-of-stream (source exhausted or
+/// errored) — the sender side outlives the capture inside `AppState`, so
+/// channel closure can't signal EOS.
+///
+/// # Errors
+/// Propagates the error from `open` (e.g. no such audio device).
+pub fn spawn_capture<S, F>(open: F) -> Result<(broadcast::Sender<Chunk>, f32), SourceError>
+where
+    S: Source<Sample = f32>,
+    F: FnOnce() -> Result<S, SourceError> + Send + 'static,
+{
+    let (tx, _) = broadcast::channel(FEED_CAPACITY);
+    let feed = tx.clone();
+    let (rate_tx, rate_rx) = std::sync::mpsc::sync_channel::<Result<f32, SourceError>>(1);
+    std::thread::spawn(move || {
+        let mut source = match open() {
+            Ok(source) => {
+                let _ = rate_tx.send(Ok(source.sample_rate()));
+                source
+            }
+            Err(e) => {
+                let _ = rate_tx.send(Err(e));
+                return;
+            }
+        };
+        let chunk_len = ((source.sample_rate() * CAPTURE_CHUNK_S) as usize).max(256);
+        loop {
+            let mut buf = vec![0.0_f32; chunk_len];
+            match source.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    buf.truncate(n);
+                    // No subscribers is fine — the chunk falls on the floor.
+                    let _ = feed.send(Arc::new(buf));
+                }
+                Err(e) => {
+                    tracing::warn!("live capture ended: {e}");
+                    break;
+                }
+            }
+        }
+        let _ = feed.send(Arc::new(Vec::new()));
+    });
+    let sample_rate = rate_rx
+        .recv()
+        .map_err(|_| SourceError::Decode("capture thread died during open".into()))??;
+    Ok((tx, sample_rate))
+}
+
+/// Pull-based iteration over a [`Feed`]. Replay paces itself against the
+/// wall clock; live waits on the broadcast.
+enum FeedIter {
+    Replay {
+        samples: Arc<Vec<f32>>,
+        pos: usize,
+        chunk_samples: usize,
+        interval: tokio::time::Interval,
+    },
+    Live {
+        rx: broadcast::Receiver<Chunk>,
+    },
+}
+
+impl FeedIter {
+    fn new(feed: Feed, sample_rate: f32) -> Self {
+        match feed {
+            Feed::Replay {
+                samples,
+                pace_factor,
+            } => {
+                // Pacing: one tick per ~20 ms of source audio, scaled by
+                // pace_factor.
+                let chunk_samples = ((sample_rate * 0.020) as usize).max(64);
+                let effective_rate = (sample_rate * pace_factor.max(0.01)).max(1.0);
+                let chunk_period = Duration::from_secs_f64(
+                    f64::from(chunk_samples as u32) / f64::from(effective_rate),
+                );
+                let mut interval = tokio::time::interval(chunk_period);
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                Self::Replay {
+                    samples,
+                    pos: 0,
+                    chunk_samples,
+                    interval,
+                }
+            }
+            Feed::Live { rx } => Self::Live { rx },
+        }
+    }
+
+    /// Next chunk of input, or `None` at end of stream. A lagged live
+    /// subscriber (pipeline slower than capture for ~13 s) loses the
+    /// dropped samples but keeps streaming.
+    async fn next(&mut self) -> Option<Chunk> {
+        match self {
+            Self::Replay {
+                samples,
+                pos,
+                chunk_samples,
+                interval,
+            } => {
+                if *pos >= samples.len() {
+                    return None;
+                }
+                interval.tick().await;
+                let end = (*pos + *chunk_samples).min(samples.len());
+                let chunk = Arc::new(samples[*pos..end].to_vec());
+                *pos = end;
+                Some(chunk)
+            }
+            Self::Live { rx } => loop {
+                match rx.recv().await {
+                    Ok(chunk) if chunk.is_empty() => return None,
+                    Ok(chunk) => return Some(chunk),
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!("live feed lagged: {n} chunks dropped");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return None,
+                }
+            },
+        }
+    }
+}
+
+/// Stream a [`Feed`] through a fresh decode pipeline, publishing
+/// [`Event`]s. Returns at end of feed or when the receiver is dropped.
 #[allow(clippy::too_many_lines)]
 pub async fn pump(
     input: String,
-    samples: Arc<Vec<f32>>,
     sample_rate: f32,
+    feed: Feed,
     cfg: Arc<PipelineConfig>,
-    pace_factor: f32,
     tx: mpsc::Sender<Event>,
 ) {
     let mode = if cfg.scan {
@@ -194,13 +346,7 @@ pub async fn pump(
         return;
     }
 
-    // Pacing: one tick per ~20 ms of source audio, scaled by pace_factor.
-    let chunk_samples = ((sample_rate * 0.020) as usize).max(64);
-    let effective_rate = (sample_rate * pace_factor.max(0.01)).max(1.0);
-    let chunk_period =
-        Duration::from_secs_f64(f64::from(chunk_samples as u32) / f64::from(effective_rate));
-    let mut interval = tokio::time::interval(chunk_period);
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut feed = FeedIter::new(feed, sample_rate);
 
     if cfg.scan {
         if tx
@@ -214,9 +360,8 @@ pub async fn pump(
             return;
         }
         let mut state = SkimState::new(&cfg, sample_rate);
-        for chunk in samples.chunks(chunk_samples) {
-            interval.tick().await;
-            for &sample in chunk {
+        while let Some(chunk) = feed.next().await {
+            for &sample in chunk.iter() {
                 if !state.push(sample, &tx).await {
                     return;
                 }
@@ -270,9 +415,8 @@ pub async fn pump(
         .fft
         .then(|| SpectrumEmitter::new(env_rate, 0.0, sample_rate / 2.0));
 
-    for chunk in samples.chunks(chunk_samples) {
-        interval.tick().await;
-        for &sample in chunk {
+    while let Some(chunk) = feed.next().await {
+        for &sample in chunk.iter() {
             match feed_sample(
                 sample,
                 &mut backend,

@@ -14,10 +14,9 @@ pub async fn handle(mut socket: WebSocket, state: AppState) {
     let (tx, mut rx) = mpsc::channel::<Event>(256);
     tokio::spawn(pipeline::pump(
         state.input.clone(),
-        state.samples.clone(),
         state.sample_rate,
+        state.feed(),
         state.cfg.clone(),
-        state.pace_factor,
         tx,
     ));
 
