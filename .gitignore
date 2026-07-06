@@ -26,3 +26,6 @@ Thumbs.db
 /web/node_modules/
 /web/.svelte-kit/
 /web/build/
+
+# Local off-air recordings kept in the repo root for tuning
+/*.wav

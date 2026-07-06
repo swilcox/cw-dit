@@ -32,6 +32,15 @@ cargo run -p cwdit-server -- /tmp/cq.wav -t 700 -w 18
 Open `http://127.0.0.1:3000`. Pass `--web-dir path/to/build` if the built
 assets live somewhere other than `web/build/`.
 
+The server skims too: with `--scan` (instead of `-t`/`--channels`) it
+re-detects stations every `--scan-duration` seconds and the UI shows
+channels opening and closing as stations come and go, with the waterfall
+cropped to the scanned band:
+
+```sh
+cargo run -p cwdit-server -- /tmp/recording.wav --scan --wpm 25
+```
+
 For frontend hot reload run Vite separately — it proxies `/ws` to the Rust
 server automatically:
 
@@ -58,14 +67,18 @@ them:
 cargo run -p cwdit-cli -- /tmp/two.wav --fft --channels 600,1400 --wpm 30
 ```
 
-Auto-detect every CW signal in the passband — no `--channels` list needed.
-The first few seconds of audio are analysed for occupied bins (keyed peaks
-above the noise floor, with sidelobe / keying-sideband suppression), then
-every detected signal gets its own decoder:
+Skim the passband — no `--channels` list needed. Detection re-runs every
+`--scan-duration` seconds (long-window FFT, local-noise-floor SNR gate,
+sidelobe / keying-sideband suppression): a decode channel opens when a
+station keys up and closes after `--channel-timeout` (default 30 s) of
+silence, so stations that come and go over the recording are all caught:
 
 ```sh
-cargo run -p cwdit-cli -- /tmp/recording.wav --fft --scan --wpm 25
+cargo run -p cwdit-cli -- /tmp/recording.wav --scan --wpm 25
 ```
+
+Adding `--fft` keeps the older one-shot flow — calibrate on the opening
+interval, then decode that fixed channel list via the FFT channelizer.
 
 Live audio from the default system input (e.g. feed a receiver's audio output
 into the soundcard):
