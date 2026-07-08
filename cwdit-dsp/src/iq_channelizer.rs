@@ -200,6 +200,35 @@ impl IqChannelizer {
     }
 }
 
+impl crate::Channelizer for IqChannelizer {
+    type Input = Complex32;
+
+    fn push(&mut self, sample: Complex32) -> Option<&[Complex32]> {
+        Self::push(self, sample)
+    }
+    fn channel_count(&self) -> usize {
+        Self::channel_count(self)
+    }
+    fn bin_frequency(&self, idx: usize) -> f32 {
+        Self::bin_frequency(self, idx)
+    }
+    fn bin_index_for(&self, freq_hz: f32) -> usize {
+        Self::bin_index_for(self, freq_hz)
+    }
+    fn bin_spacing_hz(&self) -> f32 {
+        Self::bin_spacing_hz(self)
+    }
+    fn fft_size(&self) -> usize {
+        Self::fft_size(self)
+    }
+    fn output_sample_rate(&self) -> f32 {
+        Self::output_sample_rate(self)
+    }
+    fn fresh(&self) -> Self {
+        Self::new(self.fft_size, self.hop, self.sample_rate, self.center_freq)
+    }
+}
+
 fn hann(n: usize) -> Vec<f32> {
     assert!(n >= 2);
     let denom = (n - 1) as f32;

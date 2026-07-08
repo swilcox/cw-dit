@@ -15,16 +15,19 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use cwdit_dsp::{
-    BinStats, ChannelTracker, Debouncer, Detector, DetectorConfig, FftChannelizer, Goertzel,
-    GoertzelBank, IqChannelizer, MovingAverage, RunLengthEncoder, ScanConfig, Threshold,
-    TrackerConfig, skim, suppress_correlated_ghosts,
+    BinStats, ChannelTracker, Channelizer, Debouncer, Detector, DetectorConfig, FftChannelizer,
+    Goertzel, GoertzelBank, MovingAverage, RunLengthEncoder, ScanConfig, Threshold, TrackerConfig,
+    skim, suppress_correlated_ghosts,
 };
 use cwdit_morse::{BootstrapDecoder, Decoded, TimingEstimator};
 use cwdit_source::{AudioSource, Source, WavSource};
-use rustfft::num_complex::Complex32;
 
 #[cfg(feature = "soapy")]
+use cwdit_dsp::IqChannelizer;
+#[cfg(feature = "soapy")]
 use cwdit_source::SoapySource;
+#[cfg(feature = "soapy")]
+use rustfft::num_complex::Complex32;
 
 // Window sizing, detection thresholds, and ghost-filter policy live in
 // `cwdit_dsp::skim`, shared with the server front-end.
@@ -766,13 +769,13 @@ fn scan_to_tones<C, S>(
     max_freq_hz: f32,
 ) -> Result<ScanResult<C::Input>, Box<dyn Error>>
 where
-    C: ChannelizerLike,
+    C: Channelizer,
     C::Input: Copy + Default,
     S: Source<Sample = C::Input>,
 {
     let sample_rate = source.sample_rate();
     let target_samples =
-        (args.scan_duration * sample_rate).max(channelizer.fft_size_hint() as f32) as usize;
+        (args.scan_duration * sample_rate).max(channelizer.fft_size() as f32) as usize;
     let mut prefetch: Vec<C::Input> = Vec::with_capacity(target_samples);
     let mut stats = BinStats::new(channelizer.channel_count());
     let mut mag_frame = vec![0.0_f32; channelizer.channel_count()];
@@ -861,61 +864,6 @@ where
     }
 
     Ok((tones, prefetch))
-}
-
-/// Common shape of an FFT channelizer for both real and IQ inputs.
-trait ChannelizerLike {
-    type Input: Copy + Default;
-    fn push(&mut self, sample: Self::Input) -> Option<&[Complex32]>;
-    fn channel_count(&self) -> usize;
-    fn bin_frequency(&self, idx: usize) -> f32;
-    fn bin_index_for(&self, freq_hz: f32) -> usize;
-    fn bin_spacing_hz(&self) -> f32;
-    fn fft_size_hint(&self) -> usize;
-}
-
-impl ChannelizerLike for FftChannelizer {
-    type Input = f32;
-    fn push(&mut self, sample: f32) -> Option<&[Complex32]> {
-        FftChannelizer::push(self, sample)
-    }
-    fn channel_count(&self) -> usize {
-        FftChannelizer::channel_count(self)
-    }
-    fn bin_frequency(&self, idx: usize) -> f32 {
-        FftChannelizer::bin_frequency(self, idx)
-    }
-    fn bin_index_for(&self, freq_hz: f32) -> usize {
-        FftChannelizer::bin_index_for(self, freq_hz)
-    }
-    fn bin_spacing_hz(&self) -> f32 {
-        FftChannelizer::bin_spacing_hz(self)
-    }
-    fn fft_size_hint(&self) -> usize {
-        FftChannelizer::fft_size(self)
-    }
-}
-
-impl ChannelizerLike for IqChannelizer {
-    type Input = Complex32;
-    fn push(&mut self, sample: Complex32) -> Option<&[Complex32]> {
-        IqChannelizer::push(self, sample)
-    }
-    fn channel_count(&self) -> usize {
-        IqChannelizer::channel_count(self)
-    }
-    fn bin_frequency(&self, idx: usize) -> f32 {
-        IqChannelizer::bin_frequency(self, idx)
-    }
-    fn bin_index_for(&self, freq_hz: f32) -> usize {
-        IqChannelizer::bin_index_for(self, freq_hz)
-    }
-    fn bin_spacing_hz(&self) -> f32 {
-        IqChannelizer::bin_spacing_hz(self)
-    }
-    fn fft_size_hint(&self) -> usize {
-        IqChannelizer::fft_size(self)
-    }
 }
 
 /// Narrow trait over whatever DSP front end produces one envelope sample

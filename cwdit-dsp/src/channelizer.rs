@@ -29,6 +29,48 @@ use std::sync::Arc;
 
 use rustfft::{Fft, FftPlanner, num_complex::Complex32};
 
+/// Common shape of an FFT channelizer, over either real audio
+/// ([`FftChannelizer`]) or complex IQ
+/// ([`IqChannelizer`](crate::IqChannelizer)). Code that only consumes the
+/// bin grid — detection, skimming, waterfalls — can be generic over this
+/// and stay input-agnostic. Frequencies are whatever the implementation's
+/// grid speaks: audio Hz for real input, absolute RF Hz for IQ.
+pub trait Channelizer {
+    /// Input sample type: `f32` for real audio, `Complex32` for IQ.
+    type Input: Copy + Default;
+
+    /// Feed one input sample; `Some(bins)` every hop once the analysis
+    /// window has filled. Bin `k`'s centre frequency is
+    /// [`bin_frequency(k)`](Self::bin_frequency); frequency increases
+    /// monotonically with `k` for every implementation.
+    fn push(&mut self, sample: Self::Input) -> Option<&[Complex32]>;
+
+    /// Number of output bins per frame.
+    fn channel_count(&self) -> usize;
+
+    /// Centre frequency of bin `idx`, in Hz.
+    fn bin_frequency(&self, idx: usize) -> f32;
+
+    /// Nearest bin index for `freq_hz`, clamped to the valid range.
+    fn bin_index_for(&self, freq_hz: f32) -> usize;
+
+    /// Bin spacing in Hz.
+    fn bin_spacing_hz(&self) -> f32;
+
+    /// FFT size `N` (input samples per analysis window).
+    fn fft_size(&self) -> usize;
+
+    /// Output frame rate, in frames per second.
+    fn output_sample_rate(&self) -> f32;
+
+    /// A new channelizer with identical parameters and empty analysis
+    /// state — for replaying buffered input from a known start point.
+    #[must_use]
+    fn fresh(&self) -> Self
+    where
+        Self: Sized;
+}
+
 /// Uniform-grid FFT channelizer over real-valued audio.
 pub struct FftChannelizer {
     fft_size: usize,
@@ -179,6 +221,35 @@ impl FftChannelizer {
         self.samples_since_emit = 0;
         self.emitted_once = true;
         Some(&self.bins)
+    }
+}
+
+impl Channelizer for FftChannelizer {
+    type Input = f32;
+
+    fn push(&mut self, sample: f32) -> Option<&[Complex32]> {
+        Self::push(self, sample)
+    }
+    fn channel_count(&self) -> usize {
+        Self::channel_count(self)
+    }
+    fn bin_frequency(&self, idx: usize) -> f32 {
+        Self::bin_frequency(self, idx)
+    }
+    fn bin_index_for(&self, freq_hz: f32) -> usize {
+        Self::bin_index_for(self, freq_hz)
+    }
+    fn bin_spacing_hz(&self) -> f32 {
+        Self::bin_spacing_hz(self)
+    }
+    fn fft_size(&self) -> usize {
+        Self::fft_size(self)
+    }
+    fn output_sample_rate(&self) -> f32 {
+        Self::output_sample_rate(self)
+    }
+    fn fresh(&self) -> Self {
+        Self::new(self.fft_size, self.hop, self.sample_rate)
     }
 }
 
