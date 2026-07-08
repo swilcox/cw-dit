@@ -100,8 +100,12 @@ Pick a specific input device with `--device "Name"`.
 
 ## SDR (live IQ via SoapySDR)
 
-Skim every CW signal across the radio's full sampled bandwidth in one pass.
-Built behind the `soapy` cargo feature so the SoapySDR linkage is opt-in.
+Skim every CW signal across the radio's full sampled bandwidth. Like the
+audio path, `--sdr --scan` skims *continuously*: detection re-runs every
+`--scan-duration` seconds on an RF bin grid and decode channels open and
+close as stations come and go (add `--fft` for the older one-shot
+calibrate-then-decode flow). Built behind the `soapy` cargo feature so the
+SoapySDR linkage is opt-in.
 
 Install the host bits once (macOS examples — pick the driver modules that
 match your hardware):

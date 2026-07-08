@@ -23,7 +23,7 @@ use cwdit_morse::{BootstrapDecoder, Decoded, TimingEstimator};
 use cwdit_source::{AudioSource, Source, WavSource};
 
 #[cfg(feature = "soapy")]
-use cwdit_dsp::IqChannelizer;
+use cwdit_dsp::{IqChannelizer, IqDetector, IqTone};
 #[cfg(feature = "soapy")]
 use cwdit_source::SoapySource;
 #[cfg(feature = "soapy")]
@@ -405,6 +405,12 @@ fn decode_iq<S: Source<Sample = Complex32>>(
     mut source: S,
     center_freq: f32,
 ) -> Result<(), Box<dyn Error>> {
+    // Like the audio path, --scan without --fft skims continuously:
+    // detection re-runs every interval and IqTone decode channels come and
+    // go. --scan --fft keeps the one-shot calibrate-then-decode flow below.
+    if args.scan && !args.fft {
+        return skim_iq(args, source, center_freq);
+    }
     let sample_rate = source.sample_rate();
     let fft_size = args.resolved_iq_fft_size(sample_rate);
     let hop = args.resolved_iq_hop(sample_rate, fft_size);
@@ -570,20 +576,43 @@ fn feed_sample<T: Copy + Default>(
     Ok(())
 }
 
-/// One live skimmer channel: a Goertzel filter on the detected tone
+/// A single-tone envelope detector for one skimmer channel. Abstracts the
+/// real-audio [`Goertzel`] and IQ [`IqTone`] filters behind one interface:
+/// feed one input sample, get an envelope magnitude at each block boundary.
+trait DecodeFilter {
+    type Input: Copy + Default;
+    fn push(&mut self, sample: Self::Input) -> Option<f32>;
+}
+
+impl DecodeFilter for Goertzel {
+    type Input = f32;
+    fn push(&mut self, sample: f32) -> Option<f32> {
+        Goertzel::push(self, sample)
+    }
+}
+
+#[cfg(feature = "soapy")]
+impl DecodeFilter for IqTone {
+    type Input = Complex32;
+    fn push(&mut self, sample: Complex32) -> Option<f32> {
+        IqTone::push(self, sample)
+    }
+}
+
+/// One live skimmer channel: a [`DecodeFilter`] on the detected tone
 /// feeding its own decode chain, with per-word buffered output.
-struct LiveChannel {
+struct LiveChannel<F: DecodeFilter> {
     label: String,
-    filter: Goertzel,
+    filter: F,
     chain: ChannelChain,
     pending: String,
 }
 
-impl LiveChannel {
-    fn new(tone: f32, sample_rate: f32, block_len: u32, env_rate: f32, args: &Args) -> Self {
+impl<F: DecodeFilter> LiveChannel<F> {
+    fn new(label: String, filter: F, env_rate: f32, args: &Args) -> Self {
         Self {
-            label: format!("{tone:>6.0} Hz"),
-            filter: Goertzel::new(tone, sample_rate, block_len),
+            label,
+            filter,
             chain: ChannelChain::new(
                 env_rate,
                 args.wpm,
@@ -599,7 +628,7 @@ impl LiveChannel {
         }
     }
 
-    fn feed<W: Write + ?Sized>(&mut self, sample: f32, out: &mut W) -> io::Result<()> {
+    fn feed<W: Write + ?Sized>(&mut self, sample: F::Input, out: &mut W) -> io::Result<()> {
         if let Some(env) = self.filter.push(sample) {
             for ev in self.chain.feed_envelope(env) {
                 write_multi_event(out, &self.label, &mut self.pending, ev)?;
@@ -628,40 +657,171 @@ impl LiveChannel {
     }
 }
 
-/// Continuous audio-path skimmer: a [`Detector`] runs per-interval
-/// detection, a [`ChannelTracker`] decides lifecycle, and [`LiveChannel`]s
-/// decode. A newly spawned channel replays the interval that discovered
-/// it, so its first transmission is decoded from the top.
-struct Skimmer<'a> {
+/// The channelizer-specific policy a [`Skimmer`] is built around: how to
+/// size and place the detector, decode filters, and labels. `AudioSkim`
+/// works in audio Hz over an [`FftChannelizer`]; `IqSkim` works in RF Hz
+/// over an [`IqChannelizer`], so the same skim lifecycle serves both.
+trait SkimMode {
+    type Chan: Channelizer;
+    type Filter: DecodeFilter<Input = <Self::Chan as Channelizer>::Input>;
+
+    /// Scan bounds `(min, max)` in this mode's frequency units.
+    fn scan_range(&self, args: &Args, sample_rate: f32) -> (f32, f32);
+    /// Per-interval detector over the scan range.
+    fn make_detector(
+        &self,
+        args: &Args,
+        sample_rate: f32,
+        range: (f32, f32),
+    ) -> Detector<Self::Chan>;
+    /// Decode integration block length, in input samples.
+    fn block_len(&self, args: &Args, sample_rate: f32, min_freq: f32) -> u32;
+    /// Decode filter tuned to `tone` (in this mode's frequency units).
+    fn make_filter(&self, tone: f32, sample_rate: f32, block_len: u32) -> Self::Filter;
+    /// Human-readable label for a detected tone.
+    fn label(&self, tone: f32) -> String;
+}
+
+/// Real-audio skim: Goertzel decode filters on an [`FftChannelizer`] grid,
+/// frequencies in audio Hz.
+struct AudioSkim;
+
+impl SkimMode for AudioSkim {
+    type Chan = FftChannelizer;
+    type Filter = Goertzel;
+
+    fn scan_range(&self, args: &Args, _sample_rate: f32) -> (f32, f32) {
+        (
+            args.scan_min_freq.unwrap_or(300.0),
+            args.scan_max_freq.unwrap_or(3_000.0),
+        )
+    }
+
+    fn make_detector(
+        &self,
+        args: &Args,
+        sample_rate: f32,
+        range: (f32, f32),
+    ) -> Detector<FftChannelizer> {
+        let fft_size = args.resolved_scan_fft_size(sample_rate);
+        let cfg = DetectorConfig {
+            fft_size,
+            hop: args.resolved_hop(sample_rate, fft_size),
+            min_freq_hz: range.0,
+            max_freq_hz: range.1,
+            snr_db: args.scan_snr_db,
+            nms_radius: args.scan_nms_radius,
+            max_channels: args.scan_max_channels,
+            interval_s: args.scan_duration,
+        };
+        Detector::new(&cfg, sample_rate)
+    }
+
+    fn block_len(&self, args: &Args, sample_rate: f32, min_freq: f32) -> u32 {
+        args.resolved_block_len(sample_rate, &[min_freq])
+    }
+
+    fn make_filter(&self, tone: f32, sample_rate: f32, block_len: u32) -> Goertzel {
+        Goertzel::new(tone, sample_rate, block_len)
+    }
+
+    fn label(&self, tone: f32) -> String {
+        format!("{tone:>6.0} Hz")
+    }
+}
+
+/// IQ skim: [`IqTone`] decode filters on an [`IqChannelizer`] grid,
+/// frequencies in absolute RF Hz around the tuned carrier.
+#[cfg(feature = "soapy")]
+struct IqSkim {
+    center_freq: f32,
+}
+
+#[cfg(feature = "soapy")]
+impl SkimMode for IqSkim {
+    type Chan = IqChannelizer;
+    type Filter = IqTone;
+
+    fn scan_range(&self, args: &Args, sample_rate: f32) -> (f32, f32) {
+        // Default to the full passband minus a 5% guard at each edge, past
+        // the DC spur near the carrier and the folding noise at the edges.
+        let half = sample_rate * 0.5;
+        (
+            args.scan_min_freq
+                .unwrap_or(self.center_freq - half * 0.95),
+            args.scan_max_freq
+                .unwrap_or(self.center_freq + half * 0.95),
+        )
+    }
+
+    fn make_detector(
+        &self,
+        args: &Args,
+        sample_rate: f32,
+        range: (f32, f32),
+    ) -> Detector<IqChannelizer> {
+        // Detection sizes by bin spacing (25 Hz target), not dit width, so
+        // stations working each other tens of Hz apart land in separate
+        // bins; the decode filters are IqTones, not the coarse one-shot
+        // decode channelizer.
+        let fft_size = args.fft_size.unwrap_or_else(|| skim::detect_iq_fft_size(sample_rate));
+        let hop = {
+            let auto = skim::auto_hop(sample_rate, args.wpm, fft_size);
+            args.hop.unwrap_or(auto).clamp(1, fft_size / 2)
+        };
+        let cfg = DetectorConfig {
+            fft_size,
+            hop,
+            min_freq_hz: range.0,
+            max_freq_hz: range.1,
+            snr_db: args.scan_snr_db,
+            nms_radius: args.scan_nms_radius,
+            max_channels: args.scan_max_channels,
+            interval_s: args.scan_duration,
+        };
+        IqDetector::new_iq(&cfg, sample_rate, self.center_freq)
+    }
+
+    fn block_len(&self, args: &Args, sample_rate: f32, _min_freq: f32) -> u32 {
+        skim::iq_decode_block_len(sample_rate, args.wpm)
+    }
+
+    fn make_filter(&self, tone: f32, sample_rate: f32, block_len: u32) -> IqTone {
+        IqTone::new(tone - self.center_freq, sample_rate, block_len)
+    }
+
+    fn label(&self, tone: f32) -> String {
+        format!("{:>10.4} MHz", tone / 1_000_000.0)
+    }
+}
+
+/// Continuous skimmer: a [`Detector`] runs per-interval detection, a
+/// [`ChannelTracker`] decides lifecycle, and [`LiveChannel`]s decode. A
+/// newly spawned channel replays the interval that discovered it, so its
+/// first transmission is decoded from the top. The [`SkimMode`] `M`
+/// selects the audio or IQ front-end.
+struct Skimmer<'a, M: SkimMode> {
     args: &'a Args,
-    detector: Detector,
+    mode: M,
+    detector: Detector<M::Chan>,
     tracker: ChannelTracker,
-    channels: Vec<LiveChannel>,
+    channels: Vec<LiveChannel<M::Filter>>,
+    range: (f32, f32),
     sample_rate: f32,
     block_len: u32,
     env_rate: f32,
     total_samples: u64,
 }
 
-impl Skimmer<'_> {
-    fn new(args: &Args, sample_rate: f32) -> Skimmer<'_> {
-        let fft_size = args.resolved_scan_fft_size(sample_rate);
-        let min_freq = args.scan_min_freq.unwrap_or(300.0);
-        let detector_cfg = DetectorConfig {
-            fft_size,
-            hop: args.resolved_hop(sample_rate, fft_size),
-            min_freq_hz: min_freq,
-            max_freq_hz: args.scan_max_freq.unwrap_or(3_000.0),
-            snr_db: args.scan_snr_db,
-            nms_radius: args.scan_nms_radius,
-            max_channels: args.scan_max_channels,
-            interval_s: args.scan_duration,
-        };
-        let detector = Detector::new(&detector_cfg, sample_rate);
-        let spacing = sample_rate / fft_size as f32;
-        let block_len = args.resolved_block_len(sample_rate, &[min_freq]);
+impl<'a, M: SkimMode> Skimmer<'a, M> {
+    fn new(args: &'a Args, mode: M, sample_rate: f32) -> Self {
+        let range = mode.scan_range(args, sample_rate);
+        let detector = mode.make_detector(args, sample_rate, range);
+        let spacing = detector.bin_spacing_hz();
+        let block_len = mode.block_len(args, sample_rate, range.0);
         Skimmer {
             args,
+            mode,
             detector,
             tracker: ChannelTracker::new(TrackerConfig {
                 match_radius_hz: SKIM_MATCH_RADIUS_HZ.max(spacing),
@@ -669,6 +829,7 @@ impl Skimmer<'_> {
                 max_channels: args.scan_max_channels,
             }),
             channels: Vec::new(),
+            range,
             sample_rate,
             block_len,
             env_rate: sample_rate / block_len as f32,
@@ -676,7 +837,21 @@ impl Skimmer<'_> {
         }
     }
 
-    fn push_sample<W: Write + ?Sized>(&mut self, sample: f32, out: &mut W) -> io::Result<()> {
+    fn banner(&self) {
+        eprintln!(
+            "cwdit: skimming {} – {} — rescan every {:.1} s, channel timeout {:.0} s",
+            self.mode.label(self.range.0).trim(),
+            self.mode.label(self.range.1).trim(),
+            self.args.scan_duration,
+            self.args.channel_timeout,
+        );
+    }
+
+    fn push_sample<W: Write + ?Sized>(
+        &mut self,
+        sample: <M::Chan as Channelizer>::Input,
+        out: &mut W,
+    ) -> io::Result<()> {
         self.total_samples += 1;
         for ch in &mut self.channels {
             ch.feed(sample, out)?;
@@ -702,9 +877,9 @@ impl Skimmer<'_> {
             );
         }
         for &tone in &update.spawned {
-            eprintln!("cwdit: channel + {tone:.1} Hz");
-            let mut ch =
-                LiveChannel::new(tone, self.sample_rate, self.block_len, self.env_rate, self.args);
+            eprintln!("cwdit: channel + {}", self.mode.label(tone).trim());
+            let filter = self.mode.make_filter(tone, self.sample_rate, self.block_len);
+            let mut ch = LiveChannel::new(self.mode.label(tone), filter, self.env_rate, self.args);
             // Replay the discovery interval so the transmission that
             // triggered detection is decoded from its start.
             for &s in self.detector.interval_audio() {
@@ -725,21 +900,19 @@ impl Skimmer<'_> {
     }
 }
 
-/// Continuous skim of an audio source; see [`Skimmer`].
-fn skim_audio<S: Source<Sample = f32>>(args: &Args, mut source: S) -> Result<(), Box<dyn Error>> {
+/// Drive `source` through a continuous [`Skimmer`] in mode `mode`.
+fn run_skimmer<M, S>(args: &Args, mode: M, mut source: S) -> Result<(), Box<dyn Error>>
+where
+    M: SkimMode,
+    S: Source<Sample = <M::Chan as Channelizer>::Input>,
+{
     let sample_rate = source.sample_rate();
-    let mut skimmer = Skimmer::new(args, sample_rate);
-    eprintln!(
-        "cwdit: skimming {:.0}–{:.0} Hz — rescan every {:.1} s, channel timeout {:.0} s",
-        args.scan_min_freq.unwrap_or(300.0),
-        args.scan_max_freq.unwrap_or(3_000.0),
-        args.scan_duration,
-        args.channel_timeout,
-    );
+    let mut skimmer = Skimmer::new(args, mode, sample_rate);
+    skimmer.banner();
 
     let stdout = io::stdout();
     let mut out = stdout.lock();
-    let mut buf = vec![0.0_f32; 4_096];
+    let mut buf: Vec<<M::Chan as Channelizer>::Input> = vec![Default::default(); 4_096];
     loop {
         let n = source.read(&mut buf)?;
         if n == 0 {
@@ -751,6 +924,21 @@ fn skim_audio<S: Source<Sample = f32>>(args: &Args, mut source: S) -> Result<(),
     }
     skimmer.finish(&mut out)?;
     Ok(())
+}
+
+/// Continuous skim of an audio source; see [`Skimmer`].
+fn skim_audio<S: Source<Sample = f32>>(args: &Args, source: S) -> Result<(), Box<dyn Error>> {
+    run_skimmer(args, AudioSkim, source)
+}
+
+/// Continuous skim of an IQ source centred on `center_freq`; see [`Skimmer`].
+#[cfg(feature = "soapy")]
+fn skim_iq<S: Source<Sample = Complex32>>(
+    args: &Args,
+    source: S,
+    center_freq: f32,
+) -> Result<(), Box<dyn Error>> {
+    run_skimmer(args, IqSkim { center_freq }, source)
 }
 
 /// Detected tone centres (Hz) plus the buffered prefetch samples that fed

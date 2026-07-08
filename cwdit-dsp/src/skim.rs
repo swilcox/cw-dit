@@ -295,6 +295,13 @@ impl<C: Channelizer> Detector<C> {
         self.channelizer.output_sample_rate()
     }
 
+    /// Bin spacing of the detection channelizer, in Hz. Useful for sizing
+    /// a downstream channel tracker's match radius off the grid resolution.
+    #[must_use]
+    pub fn bin_spacing_hz(&self) -> f32 {
+        self.channelizer.bin_spacing_hz()
+    }
+
     /// Searched bin range as `(first, last_exclusive)` — the slice of a
     /// frame worth displaying on a waterfall.
     #[must_use]
