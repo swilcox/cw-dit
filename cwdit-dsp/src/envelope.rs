@@ -15,6 +15,33 @@
 
 use rustfft::num_complex::Complex32;
 
+/// A single-tone envelope detector: feed one input sample, get an envelope
+/// magnitude at each block boundary. Abstracts the real-audio [`Goertzel`]
+/// and IQ [`IqTone`] filters behind one interface so decode chains can be
+/// generic over the input domain.
+pub trait ToneFilter {
+    /// Input sample type: `f32` for real audio, `Complex32` for IQ.
+    type Input: Copy + Default;
+
+    /// Feed one input sample. Returns `Some(magnitude)` at the end of each
+    /// integration block, otherwise `None`.
+    fn push(&mut self, sample: Self::Input) -> Option<f32>;
+}
+
+impl ToneFilter for Goertzel {
+    type Input = f32;
+    fn push(&mut self, sample: f32) -> Option<f32> {
+        Self::push(self, sample)
+    }
+}
+
+impl ToneFilter for IqTone {
+    type Input = Complex32;
+    fn push(&mut self, sample: Complex32) -> Option<f32> {
+        Self::push(self, sample)
+    }
+}
+
 /// Single-bin Goertzel filter.
 #[derive(Debug, Clone)]
 pub struct Goertzel {

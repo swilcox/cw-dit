@@ -146,7 +146,23 @@ cargo run -p cwdit-cli --features soapy -- \
 Defaults: `--sdr` alone uses `driver=sdrplay`; `--rf-rate` defaults to
 1.024 Msps; `--rf-gain` is omitted to enable hardware AGC. Scan covers the
 whole sampled passband minus a 5 % guard at each edge unless
-`--scan-min-freq` / `--scan-max-freq` (in absolute RF Hz) override.
+`--scan-min-freq` / `--scan-max-freq` (in absolute RF Hz) override. With
+an upconverter, `--lo-offset` (e.g. `125000000` for a Ham It Up) tunes the
+radio to `--freq + --lo-offset` while every reported frequency stays in
+actual-RF terms.
+
+The server skims SDRs too — same flags, same `soapy` feature — putting
+the whole passband's waterfall and every decoded station in the browser,
+labelled in absolute RF Hz. SDR input always scans (`--scan` is required):
+
+```sh
+cargo run -p cwdit-server --features soapy -- \
+    --sdr --freq 7035000 --rf-rate 2000000 --scan --wpm 25
+```
+
+As with `--live`, one IQ capture is shared by every connected client, and
+wide detection FFTs are max-pooled down to ≤ 2048 waterfall bins per frame
+before hitting the wire.
 
 ## Development
 

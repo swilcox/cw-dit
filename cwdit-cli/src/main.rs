@@ -16,8 +16,8 @@ use std::path::PathBuf;
 use clap::Parser;
 use cwdit_dsp::{
     BinStats, ChannelTracker, Channelizer, Debouncer, Detector, DetectorConfig, FftChannelizer,
-    Goertzel, GoertzelBank, MovingAverage, RunLengthEncoder, ScanConfig, Threshold, TrackerConfig,
-    skim, suppress_correlated_ghosts,
+    Goertzel, GoertzelBank, MovingAverage, RunLengthEncoder, ScanConfig, Threshold, ToneFilter,
+    TrackerConfig, skim, suppress_correlated_ghosts,
 };
 use cwdit_morse::{BootstrapDecoder, Decoded, TimingEstimator};
 use cwdit_source::{AudioSource, Source, WavSource};
@@ -576,39 +576,16 @@ fn feed_sample<T: Copy + Default>(
     Ok(())
 }
 
-/// A single-tone envelope detector for one skimmer channel. Abstracts the
-/// real-audio [`Goertzel`] and IQ [`IqTone`] filters behind one interface:
-/// feed one input sample, get an envelope magnitude at each block boundary.
-trait DecodeFilter {
-    type Input: Copy + Default;
-    fn push(&mut self, sample: Self::Input) -> Option<f32>;
-}
-
-impl DecodeFilter for Goertzel {
-    type Input = f32;
-    fn push(&mut self, sample: f32) -> Option<f32> {
-        Goertzel::push(self, sample)
-    }
-}
-
-#[cfg(feature = "soapy")]
-impl DecodeFilter for IqTone {
-    type Input = Complex32;
-    fn push(&mut self, sample: Complex32) -> Option<f32> {
-        IqTone::push(self, sample)
-    }
-}
-
-/// One live skimmer channel: a [`DecodeFilter`] on the detected tone
+/// One live skimmer channel: a [`ToneFilter`] on the detected tone
 /// feeding its own decode chain, with per-word buffered output.
-struct LiveChannel<F: DecodeFilter> {
+struct LiveChannel<F: ToneFilter> {
     label: String,
     filter: F,
     chain: ChannelChain,
     pending: String,
 }
 
-impl<F: DecodeFilter> LiveChannel<F> {
+impl<F: ToneFilter> LiveChannel<F> {
     fn new(label: String, filter: F, env_rate: f32, args: &Args) -> Self {
         Self {
             label,
@@ -663,7 +640,7 @@ impl<F: DecodeFilter> LiveChannel<F> {
 /// over an [`IqChannelizer`], so the same skim lifecycle serves both.
 trait SkimMode {
     type Chan: Channelizer;
-    type Filter: DecodeFilter<Input = <Self::Chan as Channelizer>::Input>;
+    type Filter: ToneFilter<Input = <Self::Chan as Channelizer>::Input>;
 
     /// Scan bounds `(min, max)` in this mode's frequency units.
     fn scan_range(&self, args: &Args, sample_rate: f32) -> (f32, f32);

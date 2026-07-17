@@ -1,13 +1,14 @@
 //! Web front-end for the cw-dit skimmer.
 //!
 //! Per WebSocket connection, spawns a fresh decode pipeline and streams
-//! JSON events to the client. Input is either a WAV file — loaded once,
-//! replayed from the top for every connection at real time scaled by
-//! `pace_factor` — or live audio from a system input device, where one
-//! shared capture fans samples out and each connection decodes the
-//! stream from the moment it joins. Single-tone, fixed multi-channel
-//! (`channels`), and continuous skimming (`scan`) all run through the
-//! same [`pipeline::pump`] entry point.
+//! JSON events to the client. Input is a WAV file — loaded once, replayed
+//! from the top for every connection at real time scaled by `pace_factor`
+//! — or a shared live capture (system audio, or IQ from a `SoapySDR`
+//! radio with the `soapy` feature) that fans samples out so each
+//! connection decodes the stream from the moment it joins. Audio input
+//! runs single-tone, fixed multi-channel (`channels`), or continuous
+//! skimming (`scan`) through [`pipeline::pump`]; SDR input always skims,
+//! through [`pipeline::pump_iq`], with frequencies in absolute RF Hz.
 //!
 //! The HTTP surface mounts the `SvelteKit` SPA (built into `web/build/`) at
 //! `/` via a `ServeDir` fallback, falling back to a static stub when the
@@ -28,8 +29,17 @@ use axum::extract::{State, WebSocketUpgrade};
 use axum::response::{Html, IntoResponse};
 use axum::routing::get;
 use cwdit_source::{AudioSource, Source, SourceError};
+use rustfft::num_complex::Complex32;
 use tokio::sync::broadcast;
 use tower_http::services::{ServeDir, ServeFile};
+
+/// Default audio-path scan bounds, in Hz. SDR input defaults instead to
+/// the sampled passband minus a 5 % guard at each edge.
+const DEFAULT_AUDIO_SCAN_MIN_HZ: f32 = 300.0;
+const DEFAULT_AUDIO_SCAN_MAX_HZ: f32 = 3_000.0;
+/// Fraction of each half-passband an SDR scan covers by default — drives
+/// over DC spurs near the carrier and folding noise at the band edges.
+const SDR_SCAN_EDGE_GUARD: f32 = 0.95;
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
@@ -46,6 +56,24 @@ pub enum Input {
     /// One capture is shared by all connections; each decodes the stream
     /// from the moment it joins. `pace_factor` does not apply.
     LiveAudio { device: Option<String> },
+    /// Live IQ from a `SoapySDR` radio. Requires the `soapy` cargo feature
+    /// at build time and scan mode — the server always skims an SDR.
+    /// One capture is shared by all connections, like `LiveAudio`.
+    Sdr {
+        /// Soapy device-args string (e.g. `"driver=rtlsdr"`); empty uses
+        /// the default driver.
+        args: String,
+        /// RF centre frequency in actual-RF Hz. All reported frequencies
+        /// stay in actual-RF terms regardless of `lo_offset`.
+        freq_hz: f32,
+        /// SDR sample rate in Hz.
+        rf_rate: f32,
+        /// Gain in dB; `None` enables hardware AGC.
+        rf_gain: Option<f32>,
+        /// Local-oscillator offset in Hz for up/downconverters; the radio
+        /// is tuned to `freq_hz + lo_offset`.
+        lo_offset: f32,
+    },
 }
 
 /// Per-invocation configuration passed from the CLI into the server.
@@ -69,8 +97,11 @@ pub struct ServerConfig {
     pub scan_snr_db: f32,
     pub scan_max_channels: usize,
     pub scan_nms_radius: usize,
-    pub scan_min_freq: f32,
-    pub scan_max_freq: f32,
+    /// Scan bounds in Hz — audio Hz for audio input, absolute RF Hz for
+    /// SDR input. `None` picks the per-input default: 300–3000 Hz for
+    /// audio, the sampled passband minus a 5 % edge guard for SDR.
+    pub scan_min_freq: Option<f32>,
+    pub scan_max_freq: Option<f32>,
     /// Seconds a skimmed channel may go undetected before it closes.
     pub channel_timeout: f32,
     /// Directory containing the built `SvelteKit` assets (a SPA with an
@@ -87,7 +118,7 @@ impl ServerConfig {
 }
 
 /// The sample store connections draw from: a replayable in-memory buffer
-/// (WAV) or a shared live capture to subscribe to.
+/// (WAV) or a shared live capture (audio or IQ) to subscribe to.
 #[derive(Clone)]
 enum SharedInput {
     Replay {
@@ -96,6 +127,21 @@ enum SharedInput {
     },
     Live {
         feed: broadcast::Sender<pipeline::Chunk>,
+    },
+    LiveIq {
+        feed: broadcast::Sender<pipeline::Chunk<Complex32>>,
+        /// RF centre frequency of the IQ stream, in actual-RF Hz.
+        center_freq: f32,
+    },
+}
+
+/// A fresh per-connection feed, dispatched by input domain so the
+/// WebSocket handler can spawn the matching pipeline.
+pub enum ConnectionFeed {
+    Audio(pipeline::Feed),
+    Iq {
+        feed: pipeline::Feed<Complex32>,
+        center_freq: f32,
     },
 }
 
@@ -110,18 +156,24 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// A fresh [`pipeline::Feed`] for one connection.
-    fn feed(&self) -> pipeline::Feed {
+    /// A fresh feed for one connection.
+    fn feed(&self) -> ConnectionFeed {
         match &self.shared {
             SharedInput::Replay {
                 samples,
                 pace_factor,
-            } => pipeline::Feed::Replay {
+            } => ConnectionFeed::Audio(pipeline::Feed::Replay {
                 samples: Arc::clone(samples),
                 pace_factor: *pace_factor,
-            },
-            SharedInput::Live { feed } => pipeline::Feed::Live {
+            }),
+            SharedInput::Live { feed } => ConnectionFeed::Audio(pipeline::Feed::Live {
                 rx: feed.subscribe(),
+            }),
+            SharedInput::LiveIq { feed, center_freq } => ConnectionFeed::Iq {
+                feed: pipeline::Feed::Live {
+                    rx: feed.subscribe(),
+                },
+                center_freq: *center_freq,
             },
         }
     }
@@ -143,7 +195,7 @@ pub fn build_app(cfg: &ServerConfig) -> Result<Router, BoxError> {
                     pace_factor: cfg.pace_factor,
                 },
                 sample_rate,
-                cfg: Arc::new(pipeline_config(cfg)),
+                cfg: Arc::new(pipeline_config(cfg, audio_scan_range(cfg))),
             };
             Ok(router_for(state, cfg))
         }
@@ -156,7 +208,52 @@ pub fn build_app(cfg: &ServerConfig) -> Result<Router, BoxError> {
                 AudioSource::with_device(device.as_deref())
             })
         }
+        Input::Sdr {
+            args,
+            freq_hz,
+            rf_rate,
+            rf_gain,
+            lo_offset,
+        } => build_sdr_app(cfg, args, *freq_hz, *rf_rate, *rf_gain, *lo_offset),
     }
+}
+
+#[cfg(not(feature = "soapy"))]
+fn build_sdr_app(
+    _cfg: &ServerConfig,
+    _args: &str,
+    _freq_hz: f32,
+    _rf_rate: f32,
+    _rf_gain: Option<f32>,
+    _lo_offset: f32,
+) -> Result<Router, BoxError> {
+    Err("--sdr requires the cwdit-server `soapy` feature; rebuild with \
+         `cargo build -p cwdit-server --features soapy`"
+        .into())
+}
+
+#[cfg(feature = "soapy")]
+fn build_sdr_app(
+    cfg: &ServerConfig,
+    args: &str,
+    freq_hz: f32,
+    rf_rate: f32,
+    rf_gain: Option<f32>,
+    lo_offset: f32,
+) -> Result<Router, BoxError> {
+    use cwdit_source::SoapySource;
+
+    let driver = if args.trim().is_empty() {
+        cwdit_source::sdr::DEFAULT_DRIVER_ARGS
+    } else {
+        args
+    };
+    let label = format!("sdr {driver} @ {:.4} MHz", freq_hz / 1_000_000.0);
+    let tune_freq = freq_hz + lo_offset;
+    let device_args = args.to_owned();
+    build_app_from_iq_source(cfg, label, freq_hz, move || {
+        SoapySource::open(&device_args, tune_freq, rf_rate, rf_gain)
+    })
 }
 
 /// [`build_app`] over an arbitrary live sample source instead of a
@@ -181,12 +278,63 @@ where
         input: input_label,
         shared: SharedInput::Live { feed },
         sample_rate,
-        cfg: Arc::new(pipeline_config(cfg)),
+        cfg: Arc::new(pipeline_config(cfg, audio_scan_range(cfg))),
     };
     Ok(router_for(state, cfg))
 }
 
-fn pipeline_config(cfg: &ServerConfig) -> pipeline::PipelineConfig {
+/// [`build_app`] over an arbitrary live IQ source instead of SDR hardware
+/// — the seam tests and embedders use to feed the server synthetic IQ.
+/// `center_freq_hz` is the RF centre of the stream; scan bounds default to
+/// the sampled passband minus a 5 % guard at each edge. IQ input always
+/// scans, so `cfg.scan` must be set.
+///
+/// # Errors
+/// Propagates the error from `open`; rejects `cfg.scan == false`.
+pub fn build_app_from_iq_source<S, F>(
+    cfg: &ServerConfig,
+    input_label: String,
+    center_freq_hz: f32,
+    open: F,
+) -> Result<Router, BoxError>
+where
+    S: Source<Sample = Complex32>,
+    F: FnOnce() -> Result<S, SourceError> + Send + 'static,
+{
+    if !cfg.scan {
+        return Err("SDR/IQ input always skims: pass --scan (fixed-tone IQ decoding \
+                    is not supported in the server)"
+            .into());
+    }
+    let (feed, sample_rate) = pipeline::spawn_capture(open)?;
+    let half = sample_rate * 0.5;
+    let scan_range = (
+        cfg.scan_min_freq
+            .unwrap_or(center_freq_hz - half * SDR_SCAN_EDGE_GUARD),
+        cfg.scan_max_freq
+            .unwrap_or(center_freq_hz + half * SDR_SCAN_EDGE_GUARD),
+    );
+    let state = AppState {
+        input: input_label,
+        shared: SharedInput::LiveIq {
+            feed,
+            center_freq: center_freq_hz,
+        },
+        sample_rate,
+        cfg: Arc::new(pipeline_config(cfg, scan_range)),
+    };
+    Ok(router_for(state, cfg))
+}
+
+/// Audio-path scan bounds: the configured values, or 300–3000 Hz.
+fn audio_scan_range(cfg: &ServerConfig) -> (f32, f32) {
+    (
+        cfg.scan_min_freq.unwrap_or(DEFAULT_AUDIO_SCAN_MIN_HZ),
+        cfg.scan_max_freq.unwrap_or(DEFAULT_AUDIO_SCAN_MAX_HZ),
+    )
+}
+
+fn pipeline_config(cfg: &ServerConfig, scan_range: (f32, f32)) -> pipeline::PipelineConfig {
     pipeline::PipelineConfig {
         tones: cfg.tones(),
         wpm: cfg.wpm,
@@ -196,8 +344,8 @@ fn pipeline_config(cfg: &ServerConfig) -> pipeline::PipelineConfig {
         scan_snr_db: cfg.scan_snr_db,
         scan_max_channels: cfg.scan_max_channels,
         scan_nms_radius: cfg.scan_nms_radius,
-        scan_min_freq: cfg.scan_min_freq,
-        scan_max_freq: cfg.scan_max_freq,
+        scan_min_freq: scan_range.0,
+        scan_max_freq: scan_range.1,
         channel_timeout: cfg.channel_timeout,
     }
 }

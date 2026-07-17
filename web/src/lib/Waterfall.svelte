@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
+	import { fmtFreq, fmtFreqShort } from './format';
 
 	interface Marker {
 		id: number;
@@ -73,13 +74,13 @@
 		<canvas bind:this={canvas}></canvas>
 		{#each markers as m (m.id)}
 			<div class="marker" style:left="{toPercent(m.freqHz)}%">
-				<span class="tag">ch {m.id} · {m.freqHz.toFixed(0)}</span>
+				<span class="tag">ch {m.id} · {fmtFreqShort(m.freqHz)}</span>
 			</div>
 		{/each}
 	</div>
 	<div class="axis">
-		<span>{fMin.toFixed(0)} Hz</span>
-		<span>{fMax.toFixed(0)} Hz</span>
+		<span>{fmtFreq(fMin)}</span>
+		<span>{fmtFreq(fMax)}</span>
 	</div>
 </div>
 

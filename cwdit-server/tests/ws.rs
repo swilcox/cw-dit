@@ -6,8 +6,11 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use base64::Engine as _;
-use cwdit_server::{Input, ServerConfig, build_app, build_app_from_source};
+use cwdit_server::{
+    Input, ServerConfig, build_app, build_app_from_iq_source, build_app_from_source,
+};
 use cwdit_source::{Source, SourceError};
+use rustfft::num_complex::Complex32;
 use cwdit_synth::{SynthOptions, Track, synth_bytes, synth_to_path};
 use futures_util::StreamExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -60,8 +63,8 @@ fn base_config(input: PathBuf) -> ServerConfig {
         scan_snr_db: 8.0,
         scan_max_channels: 32,
         scan_nms_radius: 3,
-        scan_min_freq: 300.0,
-        scan_max_freq: 3000.0,
+        scan_min_freq: None,
+        scan_max_freq: None,
         channel_timeout: 30.0,
         // Tests drive the WS directly and don't care about HTML assets;
         // `None` means axum serves the embedded stub at `/`.
@@ -394,12 +397,21 @@ impl Source for LoopingPacedSource {
 }
 
 /// Render tracks to an in-memory sample buffer via `cwdit-synth`.
-fn synth_samples(tracks: &[Track], sample_rate: u32, tail_silence_s: f32) -> Vec<f32> {
+/// `noise_snr_db` adds calibrated band noise — scan-mode tests need a
+/// realistic noise floor or keying sidebands clear the detector's SNR gate.
+fn synth_samples(
+    tracks: &[Track],
+    sample_rate: u32,
+    tail_silence_s: f32,
+    noise_snr_db: Option<f32>,
+) -> Vec<f32> {
     let bytes = synth_bytes(
         tracks,
         &SynthOptions {
             sample_rate,
             tail_silence_s,
+            noise_snr_db,
+            noise_seed: 11,
             ..SynthOptions::default()
         },
     )
@@ -424,7 +436,7 @@ async fn ws_live_feed_lets_clients_join_mid_stream() {
     // paced source as if from a soundcard (8× real time to keep the test
     // quick). The client connects at some arbitrary point in the loop and
     // must lock on and decode a later repetition.
-    let samples = synth_samples(&[Track::new("CQ TEST", 25.0, 700.0)], 8_000, 1.0);
+    let samples = synth_samples(&[Track::new("CQ TEST", 25.0, 700.0)], 8_000, 1.0, None);
     let source = LoopingPacedSource {
         samples,
         pos: 0,
@@ -480,6 +492,131 @@ async fn ws_live_feed_lets_clients_join_mid_stream() {
     let freq = freq_hz.expect("channel_open");
     assert!((freq - 700.0).abs() < 0.001, "freq {freq}");
     assert!(text.contains("CQ TEST"), "decoded: {text:?}");
+}
+
+/// IQ counterpart of [`LoopingPacedSource`]: plays a synthesised buffer
+/// once as complex samples (Q = 0, so a real tone at `f` appears at both
+/// `center ± f`), paced like a live SDR, then ends the stream.
+struct FinitePacedIqSource {
+    samples: Vec<Complex32>,
+    pos: usize,
+    sample_rate: f32,
+    pace: f32,
+}
+
+impl Source for FinitePacedIqSource {
+    type Sample = Complex32;
+
+    fn sample_rate(&self) -> f32 {
+        self.sample_rate
+    }
+
+    fn read(&mut self, buf: &mut [Complex32]) -> Result<usize, SourceError> {
+        let n = buf.len().min(512).min(self.samples.len() - self.pos);
+        buf[..n].copy_from_slice(&self.samples[self.pos..self.pos + n]);
+        self.pos += n;
+        std::thread::sleep(Duration::from_secs_f32(
+            n as f32 / self.sample_rate / self.pace,
+        ));
+        Ok(n)
+    }
+}
+
+#[tokio::test]
+async fn ws_sdr_scan_skims_iq_source_in_rf_hz() {
+    const CENTER: f32 = 7_035_000.0;
+    // 700 Hz audio tone → RF station at CENTER + 700. Scanning positive
+    // offsets only keeps the real-signal mirror image at CENTER - 700 out
+    // of the detector's band.
+    let samples = synth_samples(
+        &[Track::new("CQ CQ DE K2D", 25.0, 700.0)],
+        8_000,
+        2.0,
+        Some(0.0),
+    );
+    let iq: Vec<Complex32> = samples.iter().map(|&s| Complex32::new(s, 0.0)).collect();
+    let source = FinitePacedIqSource {
+        samples: iq,
+        pos: 0,
+        sample_rate: 8_000.0,
+        pace: 8.0,
+    };
+
+    let app = build_app_from_iq_source(
+        &ServerConfig {
+            wpm: 25.0,
+            scan: true,
+            scan_min_freq: Some(CENTER + 300.0),
+            scan_max_freq: Some(CENTER + 3_000.0),
+            ..base_config(PathBuf::new())
+        },
+        "test sdr".to_owned(),
+        CENTER,
+        move || Ok(source),
+    )
+    .expect("build_app_from_iq_source");
+
+    let (addr, server) = bind_app(app).await;
+    let out = collect_events(format!("ws://{addr}/ws"), Duration::from_secs(20)).await;
+    server.abort();
+
+    assert_eq!(out.session_mode.as_deref(), Some("scan"));
+    assert!(out.got_done, "never received done event");
+    assert_eq!(
+        out.channels.len(),
+        1,
+        "expected one skimmed channel: {:?}",
+        out.channels.keys().collect::<Vec<_>>()
+    );
+    let ch = out.channels.values().next().expect("channel");
+    // The channel must be reported in absolute RF Hz, not baseband offset.
+    assert!(
+        (ch.freq_hz - f64::from(CENTER + 700.0)).abs() < 20.0,
+        "channel freq {} not near {}",
+        ch.freq_hz,
+        CENTER + 700.0
+    );
+    assert!(ch.text.contains("K2D"), "decoded: {:?}", ch.text);
+
+    // The waterfall spans the scanned RF band, also in absolute RF Hz.
+    assert!(
+        out.spectrum_count >= 4,
+        "expected waterfall frames, got {}",
+        out.spectrum_count
+    );
+    let f_min = out.spectrum_f_min.unwrap();
+    let f_max = out.spectrum_f_max.unwrap();
+    assert!(
+        (f_min - f64::from(CENTER + 300.0)).abs() < 50.0,
+        "f_min {f_min}"
+    );
+    assert!(
+        (f_max - f64::from(CENTER + 3_000.0)).abs() < 50.0,
+        "f_max {f_max}"
+    );
+    // Wire frames stay within the display cap regardless of FFT width.
+    let bins = out.spectrum_bin_count.unwrap();
+    assert!(bins <= 2_048, "spectrum frame too wide: {bins}");
+}
+
+#[tokio::test]
+async fn iq_input_without_scan_is_rejected() {
+    let err = build_app_from_iq_source(
+        &base_config(PathBuf::new()), // scan: false
+        "test sdr".to_owned(),
+        7_035_000.0,
+        move || {
+            Ok(FinitePacedIqSource {
+                samples: vec![Complex32::new(0.0, 0.0); 8],
+                pos: 0,
+                sample_rate: 8_000.0,
+                pace: 1.0,
+            })
+        },
+    )
+    .map(|_| ())
+    .expect_err("IQ without scan must be rejected");
+    assert!(err.to_string().contains("--scan"), "unexpected error: {err}");
 }
 
 #[tokio::test]

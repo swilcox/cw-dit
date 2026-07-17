@@ -7,9 +7,14 @@
 //! Two modes: **fixed** (single tone or `--channels` list, channels
 //! announced up-front) and **scan**, which skims continuously — a
 //! [`Detector`] re-runs detection every calibration interval, a
-//! [`ChannelTracker`] spawns and retires per-tone Goertzel decode
-//! channels (`channel_open` / `channel_close` events), and the detection
+//! [`ChannelTracker`] spawns and retires per-tone decode channels
+//! (`channel_open` / `channel_close` events), and the detection
 //! channelizer's frames feed the waterfall, cropped to the scanned band.
+//!
+//! Scan mode is generic over the input domain: [`pump`] skims real audio
+//! through Goertzel decode channels, [`pump_iq`] skims complex IQ from an
+//! SDR through [`IqTone`] channels on an RF bin grid, with every reported
+//! frequency in absolute RF Hz.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -17,9 +22,11 @@ use std::time::Duration;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use cwdit_dsp::{
-    ChannelTracker, Debouncer, Detector, DetectorConfig, FftChannelizer, Goertzel, GoertzelBank,
-    MovingAverage, RunLengthEncoder, Threshold, TrackerConfig, skim,
+    ChannelTracker, Channelizer, Debouncer, Detector, DetectorConfig, FftChannelizer, Goertzel,
+    GoertzelBank, IqDetector, IqTone, MovingAverage, RunLengthEncoder, Threshold, ToneFilter,
+    TrackerConfig, skim,
 };
+use rustfft::num_complex::Complex32;
 use cwdit_morse::{BootstrapDecoder, Decoded, TimingEstimator};
 use cwdit_source::{Source, SourceError, WavSource};
 use serde::Serialize;
@@ -42,6 +49,11 @@ const WPM_EVENT_THRESHOLD: f32 = 0.5;
 /// Target waterfall frame rate (frames per second). The pump decimates
 /// the channelizer's native frame rate to land near this.
 const SPECTRUM_TARGET_FPS: f32 = 25.0;
+/// Cap on bins per `Spectrum` event. An IQ detection FFT can span tens of
+/// thousands of bins — far more than a canvas can show — so frames wider
+/// than this are max-pooled down (max, not mean, so a narrow CW peak
+/// survives pooling).
+const MAX_SPECTRUM_BINS: usize = 2_048;
 /// Lower edge of the dB range mapped to `u8` 0 in spectrum frames.
 const SPECTRUM_DB_FLOOR: f32 = -80.0;
 /// Upper edge of the dB range mapped to `u8` 255 in spectrum frames.
@@ -174,19 +186,21 @@ pub fn load(path: &Path) -> Result<(Vec<f32>, f32), SourceError> {
 }
 
 /// One batch of input samples, shared between live-feed subscribers.
-pub type Chunk = Arc<Vec<f32>>;
+/// `f32` for audio, `Complex32` for IQ.
+pub type Chunk<T = f32> = Arc<Vec<T>>;
 
-/// Where a connection's samples come from.
-pub enum Feed {
+/// Where a connection's samples come from. Generic over the sample type:
+/// `f32` for audio, `Complex32` for IQ.
+pub enum Feed<T = f32> {
     /// The whole input is in memory; replay it at `pace_factor` × real
     /// time. Every connection starts from the beginning.
     Replay {
-        samples: Arc<Vec<f32>>,
+        samples: Arc<Vec<T>>,
         pace_factor: f32,
     },
     /// A shared live capture (see [`spawn_capture`]); the connection
     /// decodes the stream from "now".
-    Live { rx: broadcast::Receiver<Chunk> },
+    Live { rx: broadcast::Receiver<Chunk<T>> },
 }
 
 /// Open a live source via `open` on a dedicated capture thread and fan
@@ -201,9 +215,10 @@ pub enum Feed {
 ///
 /// # Errors
 /// Propagates the error from `open` (e.g. no such audio device).
-pub fn spawn_capture<S, F>(open: F) -> Result<(broadcast::Sender<Chunk>, f32), SourceError>
+pub fn spawn_capture<S, F>(open: F) -> Result<CaptureFeed<S::Sample>, SourceError>
 where
-    S: Source<Sample = f32>,
+    S: Source,
+    S::Sample: Default + Send + Sync + 'static,
     F: FnOnce() -> Result<S, SourceError> + Send + 'static,
 {
     let (tx, _) = broadcast::channel(FEED_CAPACITY);
@@ -222,7 +237,7 @@ where
         };
         let chunk_len = ((source.sample_rate() * CAPTURE_CHUNK_S) as usize).max(256);
         loop {
-            let mut buf = vec![0.0_f32; chunk_len];
+            let mut buf = vec![S::Sample::default(); chunk_len];
             match source.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
@@ -244,22 +259,26 @@ where
     Ok((tx, sample_rate))
 }
 
+/// What [`spawn_capture`] hands back: the broadcast feed to subscribe
+/// connections to, plus the source's sample rate.
+pub type CaptureFeed<T> = (broadcast::Sender<Chunk<T>>, f32);
+
 /// Pull-based iteration over a [`Feed`]. Replay paces itself against the
 /// wall clock; live waits on the broadcast.
-enum FeedIter {
+enum FeedIter<T = f32> {
     Replay {
-        samples: Arc<Vec<f32>>,
+        samples: Arc<Vec<T>>,
         pos: usize,
         chunk_samples: usize,
         interval: tokio::time::Interval,
     },
     Live {
-        rx: broadcast::Receiver<Chunk>,
+        rx: broadcast::Receiver<Chunk<T>>,
     },
 }
 
-impl FeedIter {
-    fn new(feed: Feed, sample_rate: f32) -> Self {
+impl<T: Copy + Send + 'static> FeedIter<T> {
+    fn new(feed: Feed<T>, sample_rate: f32) -> Self {
         match feed {
             Feed::Replay {
                 samples,
@@ -288,7 +307,7 @@ impl FeedIter {
     /// Next chunk of input, or `None` at end of stream. A lagged live
     /// subscriber (pipeline slower than capture for ~13 s) loses the
     /// dropped samples but keeps streaming.
-    async fn next(&mut self) -> Option<Chunk> {
+    async fn next(&mut self) -> Option<Chunk<T>> {
         match self {
             Self::Replay {
                 samples,
@@ -349,27 +368,8 @@ pub async fn pump(
     let mut feed = FeedIter::new(feed, sample_rate);
 
     if cfg.scan {
-        if tx
-            .send(Event::ScanStatus {
-                state: ScanState::Calibrating,
-                detected: None,
-            })
-            .await
-            .is_err()
-        {
-            return;
-        }
-        let mut state = SkimState::new(&cfg, sample_rate);
-        while let Some(chunk) = feed.next().await {
-            for &sample in chunk.iter() {
-                if !state.push(sample, &tx).await {
-                    return;
-                }
-            }
-        }
-        if state.finish(&tx).await {
-            let _ = tx.send(Event::Done).await;
-        }
+        let state = SkimState::new_audio(&cfg, sample_rate);
+        run_skim(feed, state, &tx).await;
         return;
     }
 
@@ -449,6 +449,63 @@ pub async fn pump(
     let _ = tx.send(Event::Done).await;
 }
 
+/// Stream an IQ [`Feed`] through a continuous skim pipeline centred on
+/// `center_freq` (RF Hz), publishing [`Event`]s whose frequencies —
+/// channel opens, waterfall span — are all absolute RF Hz. SDR input
+/// always scans; there is no fixed-tone IQ mode in the server.
+pub async fn pump_iq(
+    input: String,
+    sample_rate: f32,
+    center_freq: f32,
+    feed: Feed<Complex32>,
+    cfg: Arc<PipelineConfig>,
+    tx: mpsc::Sender<Event>,
+) {
+    if tx
+        .send(Event::Session {
+            input,
+            sample_rate: sample_rate as u32,
+            mode: SessionMode::Scan,
+        })
+        .await
+        .is_err()
+    {
+        return;
+    }
+    let state = SkimState::new_iq(&cfg, sample_rate, center_freq);
+    run_skim(FeedIter::new(feed, sample_rate), state, &tx).await;
+}
+
+/// Drive a feed through a [`SkimState`] until end of input or the
+/// receiver goes away. Shared by the audio and IQ scan paths.
+async fn run_skim<C, F>(mut feed: FeedIter<C::Input>, mut state: SkimState<C, F>, tx: &mpsc::Sender<Event>)
+where
+    C: Channelizer,
+    C::Input: Send + Sync + 'static,
+    F: ToneFilter<Input = C::Input>,
+{
+    if tx
+        .send(Event::ScanStatus {
+            state: ScanState::Calibrating,
+            detected: None,
+        })
+        .await
+        .is_err()
+    {
+        return;
+    }
+    while let Some(chunk) = feed.next().await {
+        for &sample in chunk.iter() {
+            if !state.push(sample, tx).await {
+                return;
+            }
+        }
+    }
+    if state.finish(tx).await {
+        let _ = tx.send(Event::Done).await;
+    }
+}
+
 /// If the FFT backend produced a frame this push and the cadence counter
 /// is due, send a `Spectrum` event. Returns `false` only when the receiver
 /// has gone away.
@@ -513,11 +570,11 @@ async fn send_decoded(tx: &mpsc::Sender<Event>, channel: u32, ev: Decoded) -> bo
     tx.send(event).await.is_ok()
 }
 
-/// One live skim channel: a Goertzel filter on the detected tone feeding
+/// One live skim channel: a [`ToneFilter`] on the detected tone feeding
 /// its own decode chain. `id` is the wire-protocol channel id.
-struct SkimChannel {
+struct SkimChannel<F: ToneFilter> {
     id: u32,
-    filter: Goertzel,
+    filter: F,
     chain: ChannelChain,
 }
 
@@ -525,24 +582,29 @@ struct SkimChannel {
 /// calibration interval, a [`ChannelTracker`] decides lifecycle, and each
 /// live station decodes through its own [`SkimChannel`]. Waterfall frames
 /// come from the detection channelizer, cropped to the scanned band.
-struct SkimState {
-    detector: Detector,
+/// Generic over the input domain: [`new_audio`](Self::new_audio) skims
+/// real audio via Goertzel channels, [`new_iq`](SkimState::new_iq) skims
+/// complex IQ via [`IqTone`] channels in absolute RF Hz.
+struct SkimState<C: Channelizer = FftChannelizer, F: ToneFilter<Input = C::Input> = Goertzel> {
+    detector: Detector<C>,
     tracker: ChannelTracker,
-    channels: Vec<SkimChannel>,
+    channels: Vec<SkimChannel<F>>,
     spectrum: SpectrumEmitter,
     /// Displayed bin range of a detection frame (the scanned band).
     range: (usize, usize),
     next_id: u32,
     announced_ready: bool,
     wpm: f32,
-    block_len: u32,
     env_rate: f32,
     sample_rate: f32,
     total_samples: u64,
+    /// Decode filter tuned to a detected tone, in this mode's frequency
+    /// units (audio Hz or absolute RF Hz).
+    make_filter: Box<dyn Fn(f32) -> F + Send + Sync>,
 }
 
 impl SkimState {
-    fn new(cfg: &PipelineConfig, sample_rate: f32) -> Self {
+    fn new_audio(cfg: &PipelineConfig, sample_rate: f32) -> Self {
         let fft_size = skim::detect_fft_size(sample_rate, cfg.wpm);
         let detector = Detector::new(
             &DetectorConfig {
@@ -557,16 +619,56 @@ impl SkimState {
             },
             sample_rate,
         );
+        let block_len = skim::decode_block_len(sample_rate, cfg.wpm, cfg.scan_min_freq);
+        let make_filter = move |tone: f32| Goertzel::new(tone, sample_rate, block_len);
+        Self::from_parts(cfg, sample_rate, detector, block_len, Box::new(make_filter))
+    }
+}
+
+impl SkimState<cwdit_dsp::IqChannelizer, IqTone> {
+    /// IQ skim over an RF bin grid centred on `center_freq`. Detection
+    /// sizes by bin spacing rather than dit width (see the CLI's `IqSkim`
+    /// rationale); `cfg.scan_min_freq` / `scan_max_freq` are absolute RF Hz.
+    fn new_iq(cfg: &PipelineConfig, sample_rate: f32, center_freq: f32) -> Self {
+        let fft_size = skim::detect_iq_fft_size(sample_rate);
+        let detector = IqDetector::new_iq(
+            &DetectorConfig {
+                fft_size,
+                hop: skim::auto_hop(sample_rate, cfg.wpm, fft_size).clamp(1, fft_size / 2),
+                min_freq_hz: cfg.scan_min_freq,
+                max_freq_hz: cfg.scan_max_freq,
+                snr_db: cfg.scan_snr_db,
+                nms_radius: cfg.scan_nms_radius,
+                max_channels: cfg.scan_max_channels,
+                interval_s: cfg.scan_duration,
+            },
+            sample_rate,
+            center_freq,
+        );
+        let block_len = skim::iq_decode_block_len(sample_rate, cfg.wpm);
+        let make_filter =
+            move |tone: f32| IqTone::new(tone - center_freq, sample_rate, block_len);
+        Self::from_parts(cfg, sample_rate, detector, block_len, Box::new(make_filter))
+    }
+}
+
+impl<C: Channelizer, F: ToneFilter<Input = C::Input>> SkimState<C, F> {
+    fn from_parts(
+        cfg: &PipelineConfig,
+        sample_rate: f32,
+        detector: Detector<C>,
+        block_len: u32,
+        make_filter: Box<dyn Fn(f32) -> F + Send + Sync>,
+    ) -> Self {
         let range = detector.bin_range();
         let spectrum = SpectrumEmitter::new(
             detector.frame_rate(),
             detector.bin_frequency(range.0),
             detector.bin_frequency(range.1 - 1),
         );
-        let block_len = skim::decode_block_len(sample_rate, cfg.wpm, cfg.scan_min_freq);
         Self {
             tracker: ChannelTracker::new(TrackerConfig {
-                match_radius_hz: SKIM_MATCH_RADIUS_HZ.max(sample_rate / fft_size as f32),
+                match_radius_hz: SKIM_MATCH_RADIUS_HZ.max(detector.bin_spacing_hz()),
                 timeout_s: cfg.channel_timeout,
                 max_channels: cfg.scan_max_channels,
             }),
@@ -576,16 +678,16 @@ impl SkimState {
             next_id: 0,
             announced_ready: false,
             wpm: cfg.wpm,
-            block_len,
             env_rate: sample_rate / block_len as f32,
             sample_rate,
             total_samples: 0,
+            make_filter,
             detector,
         }
     }
 
     /// Feed one input sample. Returns `false` when the receiver is gone.
-    async fn push(&mut self, sample: f32, tx: &mpsc::Sender<Event>) -> bool {
+    async fn push(&mut self, sample: C::Input, tx: &mpsc::Sender<Event>) -> bool {
         self.total_samples += 1;
         for ch in &mut self.channels {
             if !feed_skim_channel(ch, sample, self.env_rate, tx).await {
@@ -637,7 +739,7 @@ impl SkimState {
             }
             let mut ch = SkimChannel {
                 id,
-                filter: Goertzel::new(tone, self.sample_rate, self.block_len),
+                filter: (self.make_filter)(tone),
                 chain: ChannelChain::new(self.env_rate, self.wpm, 0.0),
             };
             // Replay the discovery interval so the transmission that
@@ -680,9 +782,9 @@ impl SkimState {
 
 /// Feed one sample to a skim channel, forwarding decode and WPM events.
 /// Returns `false` when the receiver is gone.
-async fn feed_skim_channel(
-    ch: &mut SkimChannel,
-    sample: f32,
+async fn feed_skim_channel<F: ToneFilter>(
+    ch: &mut SkimChannel<F>,
+    sample: F::Input,
     env_rate: f32,
     tx: &mpsc::Sender<Event>,
 ) -> bool {
@@ -933,11 +1035,14 @@ impl SpectrumEmitter {
             return None;
         }
         self.counter = 0;
-        if self.bytes.len() != mag.len() {
-            self.bytes.resize(mag.len(), 0);
+        let pool = mag.len().div_ceil(MAX_SPECTRUM_BINS).max(1);
+        let out_len = mag.len().div_ceil(pool);
+        if self.bytes.len() != out_len {
+            self.bytes.resize(out_len, 0);
         }
-        for (b, &m) in self.bytes.iter_mut().zip(mag) {
-            *b = mag_to_u8(m);
+        for (b, group) in self.bytes.iter_mut().zip(mag.chunks(pool)) {
+            let peak = group.iter().copied().fold(0.0_f32, f32::max);
+            *b = mag_to_u8(peak);
         }
         Some(Event::Spectrum {
             bins: BASE64.encode(&self.bytes),
@@ -957,4 +1062,39 @@ fn mag_to_u8(mag: f32) -> u8 {
     let span = SPECTRUM_DB_CEILING - SPECTRUM_DB_FLOOR;
     let t = (db - SPECTRUM_DB_FLOOR) / span;
     (t.clamp(0.0, 1.0) * 255.0).round() as u8
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Frames wider than the display cap are max-pooled, and a single
+    /// narrow spike must survive the pooling (max, not mean).
+    #[test]
+    fn spectrum_emitter_pools_wide_frames_preserving_peaks() {
+        let mut emitter = SpectrumEmitter::new(SPECTRUM_TARGET_FPS, 0.0, 1_000.0);
+        let mut mag = vec![1e-6_f32; 10_000];
+        mag[5_003] = 1.0; // one hot bin inside what will become one pool group
+        let Some(Event::Spectrum { bins, f_min, f_max, .. }) = emitter.maybe_emit(&mag) else {
+            panic!("first frame must emit immediately");
+        };
+        let bytes = BASE64.decode(bins).expect("base64");
+        // 10_000 bins pool by ceil(10_000 / 2_048) = 5 → 2_000 wire bins.
+        assert_eq!(bytes.len(), 2_000);
+        assert!(bytes.len() <= MAX_SPECTRUM_BINS);
+        assert_eq!(bytes[1_000], mag_to_u8(1.0), "spike lost in pooling");
+        // The frequency span is unchanged by pooling.
+        assert!((f_min - 0.0).abs() < f32::EPSILON && (f_max - 1_000.0).abs() < f32::EPSILON);
+    }
+
+    /// Narrow frames pass through unpooled.
+    #[test]
+    fn spectrum_emitter_leaves_narrow_frames_alone() {
+        let mut emitter = SpectrumEmitter::new(SPECTRUM_TARGET_FPS, 0.0, 1_000.0);
+        let mag = vec![0.5_f32; 512];
+        let Some(Event::Spectrum { bins, .. }) = emitter.maybe_emit(&mag) else {
+            panic!("first frame must emit immediately");
+        };
+        assert_eq!(BASE64.decode(bins).expect("base64").len(), 512);
+    }
 }

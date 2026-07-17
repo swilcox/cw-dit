@@ -453,6 +453,7 @@ dependencies = [
  "cwdit-source",
  "cwdit-synth",
  "futures-util",
+ "rustfft",
  "serde",
  "serde_json",
  "tokio",

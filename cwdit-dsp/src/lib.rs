@@ -32,7 +32,7 @@ pub mod track;
 pub use bank::GoertzelBank;
 pub use channelizer::{Channelizer, FftChannelizer};
 pub use debounce::Debouncer;
-pub use envelope::{Goertzel, IqTone};
+pub use envelope::{Goertzel, IqTone, ToneFilter};
 pub use iq_channelizer::IqChannelizer;
 pub use runlength::{Run, RunLengthEncoder};
 pub use scan::{BinStats, ScanConfig, envelope_correlation, suppress_correlated_ghosts};
