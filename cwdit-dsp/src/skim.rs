@@ -131,14 +131,25 @@ pub fn detect_iq_fft_size(sample_rate: f32) -> usize {
     n.next_power_of_two().clamp(MIN_IQ_FFT_SIZE, MAX_IQ_FFT_SIZE)
 }
 
+/// Integration window for an [`IqTone`](crate::IqTone) decode filter, as a
+/// fraction of a dit. Finer than the audio [`DECODE_WINDOW_DITS`] (1/4):
+/// off-air IQ tuning against a 40 m recording showed that 4 envelope
+/// ticks per dit leaves the slicer no room to smooth — Rayleigh noise
+/// excursions pass the SNR gate as spurious dits, and ±1 tick of edge
+/// jitter is ±25 % timing error. Twelve ticks per dit restores both:
+/// the decode chain then smooths over ~2/3 dit, which held noise-only
+/// channels near-silent where 1/4-dit windows produced a steady stream
+/// of junk marks.
+pub const IQ_DECODE_WINDOW_DITS: f32 = 1.0 / 12.0;
+
 /// Integration block length for an [`IqTone`](crate::IqTone) decode
-/// filter: a [`DECODE_WINDOW_DITS`]-long window. Unlike
+/// filter: an [`IQ_DECODE_WINDOW_DITS`]-long window. Unlike
 /// [`decode_block_len`] there is no lowest-tone cycle bound — the mixer
 /// shifts the target to DC, so any block length integrates coherently.
 #[must_use]
 pub fn iq_decode_block_len(sample_rate: f32, wpm: f32) -> u32 {
     let dit_s = 1.2 / wpm;
-    let raw = (DECODE_WINDOW_DITS * dit_s * sample_rate).round() as u32;
+    let raw = (IQ_DECODE_WINDOW_DITS * dit_s * sample_rate).round() as u32;
     raw.max(MIN_BLOCK_LEN)
 }
 

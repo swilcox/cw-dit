@@ -4,10 +4,11 @@
 //! Concrete implementations live in submodules; pull them in under a feature
 //! gate where appropriate.
 //!
-//! Currently provides [`wav::WavSource`] for mono PCM WAV files and
-//! [`audio::AudioSource`] for live input from a system audio device. With
-//! the `soapy` feature, [`sdr::SoapySource`] also yields complex IQ from any
-//! SoapySDR-supported radio.
+//! Currently provides [`wav::WavSource`] for mono PCM WAV files,
+//! [`wav::IqWavSource`] for stereo IQ recordings (I = left, Q = right),
+//! and [`audio::AudioSource`] for live input from a system audio device.
+//! With the `soapy` feature, [`sdr::SoapySource`] also yields complex IQ
+//! from any SoapySDR-supported radio.
 
 use std::fmt;
 
@@ -19,7 +20,7 @@ pub mod wav;
 pub use audio::AudioSource;
 #[cfg(feature = "soapy")]
 pub use sdr::SoapySource;
-pub use wav::WavSource;
+pub use wav::{IqWavSource, WavSource};
 
 /// A stream of samples at a fixed sample rate.
 ///

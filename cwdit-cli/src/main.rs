@@ -3,11 +3,11 @@
 //! Wires a `cwdit-source::Source` → `cwdit-dsp` (Goertzel bank or FFT
 //! channelizer → Threshold → `RunLengthEncoder`) → `cwdit-morse::Decoder`
 //! and streams the decoded text to stdout. Input is a mono PCM WAV file
-//! (`INPUT`), the default system audio input (`--live`), or — with
-//! `--features soapy` — a `SoapySDR`-supported radio (`--sdr`). Real-audio
-//! inputs flow through the original Goertzel/FFT path; IQ from `--sdr`
-//! flows through a complex-input FFT channelizer that covers the radio's
-//! full sampled bandwidth in one pass.
+//! (`INPUT`), a stereo IQ WAV recording (`--iq`), the default system audio
+//! input (`--live`), or — with `--features soapy` — a `SoapySDR`-supported
+//! radio (`--sdr`). Real-audio inputs flow through the original
+//! Goertzel/FFT path; IQ (live or recorded) flows through a complex-input
+//! FFT channelizer that covers the full sampled bandwidth in one pass.
 
 use std::error::Error;
 use std::io::{self, Write};
@@ -16,18 +16,15 @@ use std::path::PathBuf;
 use clap::Parser;
 use cwdit_dsp::{
     BinStats, ChannelTracker, Channelizer, Debouncer, Detector, DetectorConfig, FftChannelizer,
-    Goertzel, GoertzelBank, MovingAverage, RunLengthEncoder, ScanConfig, Threshold, ToneFilter,
-    TrackerConfig, skim, suppress_correlated_ghosts,
+    Goertzel, GoertzelBank, IqChannelizer, IqDetector, IqTone, MovingAverage, RunLengthEncoder,
+    ScanConfig, Threshold, ToneFilter, TrackerConfig, skim, suppress_correlated_ghosts,
 };
 use cwdit_morse::{BootstrapDecoder, Decoded, TimingEstimator};
-use cwdit_source::{AudioSource, Source, WavSource};
+use cwdit_source::{AudioSource, IqWavSource, Source, WavSource};
+use rustfft::num_complex::Complex32;
 
 #[cfg(feature = "soapy")]
-use cwdit_dsp::{IqChannelizer, IqDetector, IqTone};
-#[cfg(feature = "soapy")]
 use cwdit_source::SoapySource;
-#[cfg(feature = "soapy")]
-use rustfft::num_complex::Complex32;
 
 // Window sizing, detection thresholds, and ghost-filter policy live in
 // `cwdit_dsp::skim`, shared with the server front-end.
@@ -40,28 +37,45 @@ const SKIM_MATCH_RADIUS_HZ: f32 = 25.0;
 /// Default absolute-envelope floor for the slicer in multi-channel mode.
 const DEFAULT_MULTI_ON_FLOOR: f32 = 0.08;
 
-/// Default slicer noise-floor guard (`--min-peak`) for audio input, where
-/// soundcard levels run near full scale.
-const AUDIO_MIN_PEAK: f32 = 0.005;
+/// Per-input-domain decode-chain sizing. `min_peak` is the slicer's
+/// noise-floor guard in envelope units; `smooth_div` / `min_run_div` size
+/// the envelope smoother and glitch debouncer as divisors of a dit
+/// (smoothing spans `dit / smooth_div`, runs under `dit / min_run_div`
+/// are absorbed).
+#[derive(Clone, Copy, Debug)]
+struct ChainTuning {
+    min_peak: f32,
+    smooth_div: f32,
+    min_run_div: f32,
+}
 
-/// The same guard for SDR IQ input, whose levels run ~60 dB lower: with
-/// AGC targeting the whole passband, a single CW carrier's [`IqTone`]
-/// envelope measures ~1e-4 keyed over ~3e-5 noise (`RSPdx`, 40 m) — the
-/// audio-scale
-/// guard sits far above the signal and mutes every channel. 1e-6 stays
-/// below real noise but above numerical dust.
-const IQ_MIN_PEAK: f32 = 1e-6;
+/// Audio input: soundcard levels run near full scale, and the envelope
+/// runs only ~4 ticks/dit, leaving no room for heavier smoothing.
+const AUDIO_TUNING: ChainTuning = ChainTuning {
+    min_peak: 0.005,
+    smooth_div: 4.0,
+    min_run_div: 5.0,
+};
+
+/// SDR IQ input. Levels run ~60 dB below audio (AGC targets the whole
+/// passband; a real CW carrier's [`IqTone`] envelope measures ~1e-4 keyed
+/// over ~3e-5 noise on 40 m), so the guard drops to 1e-6 — below real
+/// noise, above numerical dust. The IQ envelope runs 12 ticks/dit (see
+/// [`skim::IQ_DECODE_WINDOW_DITS`]), so the chain smooths over ~2/3 dit
+/// and debounces at dit/3: off-air tuning showed that combination
+/// silences noise-only channels without degrading a fading station.
+const IQ_TUNING: ChainTuning = ChainTuning {
+    min_peak: 1e-6,
+    smooth_div: 1.5,
+    min_run_div: 3.0,
+};
 
 /// IQ-rate FFT auto-size targets bin spacing rather than dit width: at SDR
 /// rates the dit-width rule would pick FFTs too coarse to resolve adjacent
 /// CW signals (e.g. 245 Hz spacing at 1 Msps with N = 4096).
-#[cfg(feature = "soapy")]
 const TARGET_IQ_BIN_SPACING_HZ: f32 = 100.0;
-#[cfg(feature = "soapy")]
 const MIN_AUTO_IQ_FFT_SIZE: usize = 4096;
-#[cfg(feature = "soapy")]
 const MAX_AUTO_IQ_FFT_SIZE: usize = 65_536;
-#[cfg(feature = "soapy")]
 const TARGET_IQ_ENVELOPE_RATE_HZ: f32 = 250.0;
 
 /// Default RF sample rate when `--rf-rate` is omitted. 1.024 Msps is the
@@ -78,13 +92,19 @@ const DEFAULT_RF_SAMPLE_RATE: f32 = 1_024_000.0;
 )]
 #[allow(clippy::struct_excessive_bools)]
 struct Args {
-    /// Path to a mono PCM WAV file containing CW. Omit when using --live or
-    /// --sdr.
+    /// Path to a mono PCM WAV file containing CW (or, with --iq, a stereo
+    /// IQ recording). Omit when using --live or --sdr.
     #[arg(
         required_unless_present_any = ["live", "sdr"],
         conflicts_with_all = ["live", "sdr"],
     )]
     input: Option<PathBuf>,
+
+    /// Treat INPUT as a stereo IQ WAV recording (I = left, Q = right, e.g.
+    /// captured from an SDR) and decode it through the IQ path. Requires
+    /// --freq giving the recording's RF centre frequency.
+    #[arg(long, default_value_t = false, conflicts_with_all = ["live", "sdr"])]
+    iq: bool,
 
     /// Decode live audio from the default system input device.
     #[arg(long, default_value_t = false, conflicts_with = "sdr")]
@@ -100,8 +120,8 @@ struct Args {
     #[arg(long, num_args = 0..=1, default_missing_value = "")]
     sdr: Option<String>,
 
-    /// RF centre frequency in Hz. Required with --sdr.
-    #[arg(long, requires = "sdr")]
+    /// RF centre frequency in Hz. Required with --sdr and --iq.
+    #[arg(long)]
     freq: Option<f32>,
 
     /// SDR sample rate in Hz. Defaults to 1024000 (1.024 Msps).
@@ -244,11 +264,14 @@ impl Args {
             .unwrap_or(if guard { DEFAULT_MULTI_ON_FLOOR } else { 0.0 })
     }
 
-    /// `min_peak` scaled to the input domain's envelope levels; see
-    /// [`AUDIO_MIN_PEAK`] / [`IQ_MIN_PEAK`].
-    fn resolved_min_peak(&self, iq: bool) -> f32 {
-        self.min_peak
-            .unwrap_or(if iq { IQ_MIN_PEAK } else { AUDIO_MIN_PEAK })
+    /// Chain sizing for the input domain, with `--min-peak` applied; see
+    /// [`AUDIO_TUNING`] / [`IQ_TUNING`].
+    fn resolved_tuning(&self, iq: bool) -> ChainTuning {
+        let mut tuning = if iq { IQ_TUNING } else { AUDIO_TUNING };
+        if let Some(min_peak) = self.min_peak {
+            tuning.min_peak = min_peak;
+        }
+        tuning
     }
 
     fn resolved_fft_size(&self, sample_rate: f32) -> usize {
@@ -269,13 +292,11 @@ impl Args {
         raw.clamp(1, fft_size / 2)
     }
 
-    #[cfg(feature = "soapy")]
     fn resolved_iq_fft_size(&self, sample_rate: f32) -> usize {
         self.fft_size
             .unwrap_or_else(|| auto_iq_fft_size(sample_rate))
     }
 
-    #[cfg(feature = "soapy")]
     fn resolved_iq_hop(&self, sample_rate: f32, fft_size: usize) -> usize {
         let auto = auto_iq_hop(sample_rate);
         let raw = self.hop.unwrap_or(auto);
@@ -293,7 +314,6 @@ impl Args {
 
 /// Pick an FFT size whose bin spacing is `<= TARGET_IQ_BIN_SPACING_HZ`,
 /// clamped to a sane envelope-rate-aware range.
-#[cfg(feature = "soapy")]
 fn auto_iq_fft_size(sample_rate: f32) -> usize {
     let raw_min = (sample_rate / TARGET_IQ_BIN_SPACING_HZ).ceil() as usize;
     let pow2 = next_pow2(raw_min).max(MIN_AUTO_IQ_FFT_SIZE);
@@ -301,13 +321,11 @@ fn auto_iq_fft_size(sample_rate: f32) -> usize {
 }
 
 /// Pick an IQ hop sized to keep envelope rate near `TARGET_IQ_ENVELOPE_RATE_HZ`.
-#[cfg(feature = "soapy")]
 fn auto_iq_hop(sample_rate: f32) -> usize {
     let raw = (sample_rate / TARGET_IQ_ENVELOPE_RATE_HZ).round() as usize;
     raw.max(1)
 }
 
-#[cfg(feature = "soapy")]
 fn next_pow2(n: usize) -> usize {
     if n <= 1 {
         1
@@ -326,6 +344,26 @@ fn main() {
 fn run(args: &Args) -> Result<(), Box<dyn Error>> {
     if let Some(sdr_args) = args.sdr.as_deref() {
         return run_sdr(args, sdr_args);
+    }
+    if args.freq.is_some() && args.sdr.is_none() && !args.iq {
+        return Err("--freq only applies to --sdr or --iq input".into());
+    }
+    if args.iq {
+        let path = args
+            .input
+            .as_ref()
+            .expect("clap requires input when --live and --sdr are absent");
+        let center = args
+            .freq
+            .ok_or("--iq requires --freq <RF Hz of the recording centre>")?;
+        let source = IqWavSource::from_path(path)?;
+        eprintln!(
+            "cwdit: IQ recording at {:.0} sps centred on {:.4} MHz ({:.1} s)",
+            source.sample_rate(),
+            center / 1_000_000.0,
+            source.len() as f32 / source.sample_rate(),
+        );
+        return decode_iq(args, source, center);
     }
     if args.live {
         if args.scan {
@@ -424,10 +462,9 @@ fn decode_real<S: Source<Sample = f32>>(args: &Args, mut source: S) -> Result<()
         Box::new(GoertzelBackend::new(sample_rate, &tones, block_len))
     };
 
-    decode_pipeline(args, source, backend, &prefetch, &tones, args.resolved_min_peak(false))
+    decode_pipeline(args, source, backend, &prefetch, &tones, args.resolved_tuning(false))
 }
 
-#[cfg(feature = "soapy")]
 fn decode_iq<S: Source<Sample = Complex32>>(
     args: &Args,
     mut source: S,
@@ -470,7 +507,7 @@ fn decode_iq<S: Source<Sample = Complex32>>(
     }
 
     let backend = IqFftBackend::new(fft_size, hop, sample_rate, center_freq, &tones);
-    decode_pipeline(args, source, Box::new(backend), &prefetch, &tones, args.resolved_min_peak(true))
+    decode_pipeline(args, source, Box::new(backend), &prefetch, &tones, args.resolved_tuning(true))
 }
 
 /// Drive `source` through `backend`, post-process per-channel envelopes
@@ -481,7 +518,7 @@ fn decode_pipeline<T, S>(
     mut backend: Box<dyn Backend<Input = T>>,
     prefetch: &[T],
     tones: &[f32],
-    min_peak: f32,
+    tuning: ChainTuning,
 ) -> Result<(), Box<dyn Error>>
 where
     T: Copy + Default,
@@ -503,7 +540,7 @@ where
                 env_rate,
                 args.wpm,
                 args.peak_half_life,
-                min_peak,
+                tuning,
                 on_floor,
                 args.snr_gate,
                 !args.fixed_timing,
@@ -615,7 +652,7 @@ struct LiveChannel<F: ToneFilter> {
 }
 
 impl<F: ToneFilter> LiveChannel<F> {
-    fn new(label: String, filter: F, env_rate: f32, args: &Args, min_peak: f32) -> Self {
+    fn new(label: String, filter: F, env_rate: f32, args: &Args, tuning: ChainTuning) -> Self {
         Self {
             label,
             filter,
@@ -623,7 +660,7 @@ impl<F: ToneFilter> LiveChannel<F> {
                 env_rate,
                 args.wpm,
                 args.peak_half_life,
-                min_peak,
+                tuning,
                 // Skim channels cleared the scan's SNR gate; see
                 // resolved_on_floor.
                 args.resolved_on_floor(false),
@@ -672,8 +709,8 @@ trait SkimMode {
     type Filter: ToneFilter<Input = <Self::Chan as Channelizer>::Input>;
 
     /// Default slicer noise-floor guard, scaled to this mode's envelope
-    /// levels ([`AUDIO_MIN_PEAK`] / [`IQ_MIN_PEAK`]).
-    const MIN_PEAK: f32;
+    /// levels ([`AUDIO_TUNING`] / [`IQ_TUNING`]).
+    const TUNING: ChainTuning;
 
     /// Scan bounds `(min, max)` in this mode's frequency units.
     fn scan_range(&self, args: &Args, sample_rate: f32) -> (f32, f32);
@@ -700,7 +737,7 @@ impl SkimMode for AudioSkim {
     type Chan = FftChannelizer;
     type Filter = Goertzel;
 
-    const MIN_PEAK: f32 = AUDIO_MIN_PEAK;
+    const TUNING: ChainTuning = AUDIO_TUNING;
 
     fn scan_range(&self, args: &Args, _sample_rate: f32) -> (f32, f32) {
         (
@@ -744,17 +781,15 @@ impl SkimMode for AudioSkim {
 
 /// IQ skim: [`IqTone`] decode filters on an [`IqChannelizer`] grid,
 /// frequencies in absolute RF Hz around the tuned carrier.
-#[cfg(feature = "soapy")]
 struct IqSkim {
     center_freq: f32,
 }
 
-#[cfg(feature = "soapy")]
 impl SkimMode for IqSkim {
     type Chan = IqChannelizer;
     type Filter = IqTone;
 
-    const MIN_PEAK: f32 = IQ_MIN_PEAK;
+    const TUNING: ChainTuning = IQ_TUNING;
 
     fn scan_range(&self, args: &Args, sample_rate: f32) -> (f32, f32) {
         // Default to the full passband minus a 5% guard at each edge, past
@@ -893,12 +928,16 @@ impl<'a, M: SkimMode> Skimmer<'a, M> {
         for &tone in &update.spawned {
             eprintln!("cwdit: channel + {}", self.mode.label(tone).trim());
             let filter = self.mode.make_filter(tone, self.sample_rate, self.block_len);
+            let mut tuning = M::TUNING;
+            if let Some(min_peak) = self.args.min_peak {
+                tuning.min_peak = min_peak;
+            }
             let mut ch = LiveChannel::new(
                 self.mode.label(tone),
                 filter,
                 self.env_rate,
                 self.args,
-                self.args.min_peak.unwrap_or(M::MIN_PEAK),
+                tuning,
             );
             // Replay the discovery interval so the transmission that
             // triggered detection is decoded from its start.
@@ -952,7 +991,6 @@ fn skim_audio<S: Source<Sample = f32>>(args: &Args, source: S) -> Result<(), Box
 }
 
 /// Continuous skim of an IQ source centred on `center_freq`; see [`Skimmer`].
-#[cfg(feature = "soapy")]
 fn skim_iq<S: Source<Sample = Complex32>>(
     args: &Args,
     source: S,
@@ -1162,14 +1200,12 @@ impl Backend for FftBackend {
     }
 }
 
-#[cfg(feature = "soapy")]
 struct IqFftBackend {
     channelizer: IqChannelizer,
     bins: Vec<usize>,
     actual_freqs: Vec<f32>,
 }
 
-#[cfg(feature = "soapy")]
 impl IqFftBackend {
     fn new(fft_size: usize, hop: usize, sample_rate: f32, center_freq: f32, tones: &[f32]) -> Self {
         let channelizer = IqChannelizer::new(fft_size, hop, sample_rate, center_freq);
@@ -1186,7 +1222,6 @@ impl IqFftBackend {
     }
 }
 
-#[cfg(feature = "soapy")]
 impl Backend for IqFftBackend {
     type Input = Complex32;
     fn push(&mut self, sample: Complex32, envs: &mut [f32]) -> bool {
@@ -1226,20 +1261,21 @@ impl ChannelChain {
         env_rate: f32,
         wpm: f32,
         peak_half_life_s: f32,
-        min_peak: f32,
+        tuning: ChainTuning,
         on_floor: f32,
         snr_gate: Option<f32>,
         adapt: bool,
     ) -> Self {
-        // Smooth over ~1/4 dit and absorb runs under ~1/5 dit, both from
-        // the seed WPM so a channel keying up to ~3x faster than the seed
-        // still keeps its dits intact. Floors of 2: below that the smoother
-        // passes raw Rayleigh noise excursions and the debouncer passes
-        // 1-tick glitches, and the slicer's SNR gate alone can't hold.
+        // Smoothing and debounce sized from the seed WPM so a channel
+        // keying up to ~3x faster than the seed still keeps its dits
+        // intact; the divisors are per input domain (see [`ChainTuning`]).
+        // Floors of 2: below that the smoother passes raw Rayleigh noise
+        // excursions and the debouncer passes 1-tick glitches, and the
+        // slicer's SNR gate alone can't hold.
         let dit_ticks = 1.2 * env_rate / wpm;
-        let smooth_len = ((dit_ticks / 4.0).round() as usize).clamp(2, 16);
-        let min_run = ((dit_ticks / 5.0) as u32).max(2);
-        let mut threshold = Threshold::new(env_rate, peak_half_life_s, min_peak);
+        let smooth_len = ((dit_ticks / tuning.smooth_div).round() as usize).clamp(2, 16);
+        let min_run = ((dit_ticks / tuning.min_run_div) as u32).max(2);
+        let mut threshold = Threshold::new(env_rate, peak_half_life_s, tuning.min_peak);
         if on_floor > 0.0 {
             threshold = threshold.with_absolute_on_floor(on_floor);
         }

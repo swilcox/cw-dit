@@ -162,6 +162,16 @@ cargo run --release -p cwdit-cli --features soapy -- \
     --channels 7035500,7038200,7041000 --wpm 22
 ```
 
+Recorded IQ works too — no radio or `soapy` feature needed. `--iq` treats
+the input WAV as a stereo IQ recording (I = left channel, Q = right, any
+sample rate) and decodes it through the same path, which makes off-air
+captures replayable fixtures for decode tuning:
+
+```sh
+cargo run --release -p cwdit-cli -- \
+    recording-iq.wav --iq --freq 7030000 --scan --wpm 25
+```
+
 Defaults: `--sdr` alone uses `driver=sdrplay`; `--rf-rate` defaults to
 1.024 Msps; `--rf-gain` is omitted to enable hardware AGC. Scan covers the
 whole sampled passband minus a 5 % guard at each edge unless

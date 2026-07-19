@@ -1,9 +1,13 @@
-//! WAV-file source.
+//! WAV-file sources.
 //!
 //! [`WavSource`] reads a mono PCM WAV file and yields real-valued `f32`
 //! samples normalised to `[-1.0, 1.0]`. Integer formats (`i16`, `i32`) are
 //! scaled to the corresponding floating-point range; `f32` WAV is passed
 //! through.
+//!
+//! [`IqWavSource`] reads a *stereo* WAV as complex IQ — I in the left
+//! channel, Q in the right — the layout SDR recordings conventionally use,
+//! and what the skimmer's own IQ capture writes. Same format handling.
 //!
 //! The entire file is read into memory at construction. This keeps the
 //! implementation simple and is adequate for the recordings the skimmer is
@@ -14,6 +18,7 @@ use std::io::{BufReader, Read};
 use std::path::Path;
 
 use hound::{SampleFormat, WavReader};
+use num_complex::Complex32;
 
 use crate::{Source, SourceError};
 
@@ -76,6 +81,76 @@ impl Source for WavSource {
     }
 
     fn read(&mut self, buf: &mut [f32]) -> Result<usize, SourceError> {
+        let remaining = self.samples.len() - self.cursor;
+        let n = remaining.min(buf.len());
+        buf[..n].copy_from_slice(&self.samples[self.cursor..self.cursor + n]);
+        self.cursor += n;
+        Ok(n)
+    }
+}
+
+/// Reads a stereo WAV file in full and plays it back as a `Complex32` IQ
+/// stream: I from the left channel, Q from the right.
+#[derive(Debug)]
+pub struct IqWavSource {
+    samples: Vec<Complex32>,
+    cursor: usize,
+    sample_rate: f32,
+}
+
+impl IqWavSource {
+    /// Open an IQ WAV file on disk.
+    pub fn from_path<P: AsRef<Path>>(path: P) -> Result<Self, SourceError> {
+        let file = File::open(path.as_ref())?;
+        Self::from_reader(BufReader::new(file))
+    }
+
+    /// Read an IQ WAV stream from any [`Read`] source.
+    pub fn from_reader<R: Read>(reader: R) -> Result<Self, SourceError> {
+        let reader = WavReader::new(reader)
+            .map_err(|e| SourceError::Decode(format!("wav header: {e}")))?;
+        let spec = reader.spec();
+        if spec.channels != 2 {
+            return Err(SourceError::UnsupportedFormat(format!(
+                "expected stereo (I/Q) WAV, got {} channel(s)",
+                spec.channels
+            )));
+        }
+
+        let interleaved = decode_samples(reader, spec)?;
+        let samples = interleaved
+            .chunks_exact(2)
+            .map(|iq| Complex32::new(iq[0], iq[1]))
+            .collect();
+
+        Ok(Self {
+            samples,
+            cursor: 0,
+            sample_rate: spec.sample_rate as f32,
+        })
+    }
+
+    /// Total number of IQ samples in the file.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.samples.len()
+    }
+
+    /// Whether the file had zero samples.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.samples.is_empty()
+    }
+}
+
+impl Source for IqWavSource {
+    type Sample = Complex32;
+
+    fn sample_rate(&self) -> f32 {
+        self.sample_rate
+    }
+
+    fn read(&mut self, buf: &mut [Complex32]) -> Result<usize, SourceError> {
         let remaining = self.samples.len() - self.cursor;
         let n = remaining.min(buf.len());
         buf[..n].copy_from_slice(&self.samples[self.cursor..self.cursor + n]);
@@ -186,6 +261,48 @@ mod tests {
         while src.read(&mut buf).unwrap() > 0 {}
         // Now at EOF
         assert_eq!(src.read(&mut buf).unwrap(), 0);
+    }
+
+    /// A complex exponential written as stereo float32 must come back with
+    /// I/Q pairing intact: constant magnitude and the right phase advance.
+    #[test]
+    fn reads_stereo_float_wav_as_iq() {
+        let spec = WavSpec {
+            channels: 2,
+            sample_rate: 8_000,
+            bits_per_sample: 32,
+            sample_format: SampleFormat::Float,
+        };
+        let step = 2.0 * std::f32::consts::PI * 700.0 / 8_000.0;
+        let mut buf = Cursor::new(Vec::new());
+        {
+            let mut w = WavWriter::new(&mut buf, spec).unwrap();
+            for n in 0..800 {
+                let ph = step * n as f32;
+                w.write_sample(0.25 * ph.cos()).unwrap();
+                w.write_sample(0.25 * ph.sin()).unwrap();
+            }
+            w.finalize().unwrap();
+        }
+        let mut src = IqWavSource::from_reader(Cursor::new(buf.into_inner())).unwrap();
+        assert!((src.sample_rate() - 8_000.0).abs() < 0.5);
+        assert_eq!(src.len(), 800);
+
+        let mut out = vec![Complex32::new(0.0, 0.0); 800];
+        assert_eq!(src.read(&mut out).unwrap(), 800);
+        for c in &out {
+            assert!((c.norm() - 0.25).abs() < 1e-3, "|{c}| != 0.25");
+        }
+        let rot = out[1] / out[0];
+        assert!((rot.arg() - step).abs() < 1e-3, "phase step {}", rot.arg());
+        assert_eq!(src.read(&mut out).unwrap(), 0, "expected EOF");
+    }
+
+    #[test]
+    fn iq_rejects_mono_wav() {
+        let bytes = write_sine(700.0, 8_000, 0.01);
+        let err = IqWavSource::from_reader(Cursor::new(bytes)).unwrap_err();
+        assert!(matches!(err, SourceError::UnsupportedFormat(_)));
     }
 
     #[test]
