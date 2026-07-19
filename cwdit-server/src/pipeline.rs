@@ -38,8 +38,15 @@ use tokio::sync::{broadcast, mpsc};
 const DEFAULT_MULTI_ON_FLOOR: f32 = 0.08;
 /// Peak-detector half-life for the envelope slicer, in seconds.
 const PEAK_HALF_LIFE_S: f32 = 1.0;
-/// Minimum envelope peak used as a noise-floor guard (0.0–1.0).
-const MIN_PEAK: f32 = 0.005;
+/// Minimum envelope peak used as a noise-floor guard on audio input,
+/// where soundcard levels run near full scale.
+const AUDIO_MIN_PEAK: f32 = 0.005;
+/// The same guard for SDR IQ input, whose levels run ~60 dB lower: with
+/// AGC targeting the whole passband, a single CW carrier's [`IqTone`]
+/// envelope measures ~1e-4 keyed over ~3e-5 noise (`RSPdx`, 40 m) — an
+/// audio-scale guard would sit far above the signal and mute every
+/// channel. 1e-6 stays below real noise but above numerical dust.
+const IQ_MIN_PEAK: f32 = 1e-6;
 /// A detection this close to a live channel refreshes it instead of
 /// spawning a duplicate.
 const SKIM_MATCH_RADIUS_HZ: f32 = 25.0;
@@ -65,6 +72,12 @@ const CAPTURE_CHUNK_S: f32 = 0.05;
 /// Broadcast depth, in chunks (~13 s at [`CAPTURE_CHUNK_S`]), before a
 /// slow pipeline starts losing samples.
 const FEED_CAPACITY: usize = 256;
+/// Seconds of input replayed into a newly spawned skim channel between
+/// yields. The discovery-interval replay is a CPU burst (seconds of
+/// samples × every new channel, ~1 s of wall time at SDR rates even in
+/// release builds); yielding keeps it from stalling the runtime worker
+/// and starving other connections.
+const REPLAY_YIELD_S: f32 = 0.025;
 
 /// Per-connection processing configuration. Clone-friendly (small, no IO).
 #[derive(Clone, Debug)]
@@ -396,7 +409,7 @@ pub async fn pump(
 
     let mut chains: Vec<ChannelChain> = tones
         .iter()
-        .map(|_| ChannelChain::new(env_rate, cfg.wpm, on_floor))
+        .map(|_| ChannelChain::new(env_rate, cfg.wpm, on_floor, AUDIO_MIN_PEAK))
         .collect();
 
     for (idx, (freq, chain)) in actual_freqs.iter().zip(&chains).enumerate() {
@@ -598,6 +611,9 @@ struct SkimState<C: Channelizer = FftChannelizer, F: ToneFilter<Input = C::Input
     env_rate: f32,
     sample_rate: f32,
     total_samples: u64,
+    /// Slicer noise-floor guard for spawned channels, scaled to this
+    /// mode's envelope levels ([`AUDIO_MIN_PEAK`] / [`IQ_MIN_PEAK`]).
+    min_peak: f32,
     /// Decode filter tuned to a detected tone, in this mode's frequency
     /// units (audio Hz or absolute RF Hz).
     make_filter: Box<dyn Fn(f32) -> F + Send + Sync>,
@@ -621,7 +637,14 @@ impl SkimState {
         );
         let block_len = skim::decode_block_len(sample_rate, cfg.wpm, cfg.scan_min_freq);
         let make_filter = move |tone: f32| Goertzel::new(tone, sample_rate, block_len);
-        Self::from_parts(cfg, sample_rate, detector, block_len, Box::new(make_filter))
+        Self::from_parts(
+            cfg,
+            sample_rate,
+            detector,
+            block_len,
+            AUDIO_MIN_PEAK,
+            Box::new(make_filter),
+        )
     }
 }
 
@@ -648,7 +671,14 @@ impl SkimState<cwdit_dsp::IqChannelizer, IqTone> {
         let block_len = skim::iq_decode_block_len(sample_rate, cfg.wpm);
         let make_filter =
             move |tone: f32| IqTone::new(tone - center_freq, sample_rate, block_len);
-        Self::from_parts(cfg, sample_rate, detector, block_len, Box::new(make_filter))
+        Self::from_parts(
+            cfg,
+            sample_rate,
+            detector,
+            block_len,
+            IQ_MIN_PEAK,
+            Box::new(make_filter),
+        )
     }
 }
 
@@ -658,6 +688,7 @@ impl<C: Channelizer, F: ToneFilter<Input = C::Input>> SkimState<C, F> {
         sample_rate: f32,
         detector: Detector<C>,
         block_len: u32,
+        min_peak: f32,
         make_filter: Box<dyn Fn(f32) -> F + Send + Sync>,
     ) -> Self {
         let range = detector.bin_range();
@@ -681,6 +712,7 @@ impl<C: Channelizer, F: ToneFilter<Input = C::Input>> SkimState<C, F> {
             env_rate: sample_rate / block_len as f32,
             sample_rate,
             total_samples: 0,
+            min_peak,
             make_filter,
             detector,
         }
@@ -740,11 +772,16 @@ impl<C: Channelizer, F: ToneFilter<Input = C::Input>> SkimState<C, F> {
             let mut ch = SkimChannel {
                 id,
                 filter: (self.make_filter)(tone),
-                chain: ChannelChain::new(self.env_rate, self.wpm, 0.0),
+                chain: ChannelChain::new(self.env_rate, self.wpm, 0.0, self.min_peak),
             };
             // Replay the discovery interval so the transmission that
-            // triggered detection is decoded from its start.
-            for &s in self.detector.interval_audio() {
+            // triggered detection is decoded from its start, yielding
+            // periodically so the burst can't monopolise the runtime.
+            let yield_stride = ((self.sample_rate * REPLAY_YIELD_S) as usize).max(1);
+            for (i, &s) in self.detector.interval_audio().iter().enumerate() {
+                if i % yield_stride == 0 {
+                    tokio::task::yield_now().await;
+                }
                 if !feed_skim_channel(&mut ch, s, self.env_rate, tx).await {
                     return false;
                 }
@@ -934,13 +971,13 @@ struct ChannelChain {
 }
 
 impl ChannelChain {
-    fn new(env_rate: f32, wpm: f32, on_floor: f32) -> Self {
+    fn new(env_rate: f32, wpm: f32, on_floor: f32, min_peak: f32) -> Self {
         // Smooth over ~1/4 dit and absorb runs under ~1/5 dit, sized from
         // the seed WPM (see the cwdit-cli chain for the rationale).
         let dit_ticks = 1.2 * env_rate / wpm;
         let smooth_len = ((dit_ticks / 4.0).round() as usize).clamp(2, 16);
         let min_run = ((dit_ticks / 5.0) as u32).max(2);
-        let mut threshold = Threshold::new(env_rate, PEAK_HALF_LIFE_S, MIN_PEAK);
+        let mut threshold = Threshold::new(env_rate, PEAK_HALF_LIFE_S, min_peak);
         if on_floor > 0.0 {
             threshold = threshold.with_absolute_on_floor(on_floor);
         }

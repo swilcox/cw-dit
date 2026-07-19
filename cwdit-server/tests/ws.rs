@@ -534,7 +534,13 @@ async fn ws_sdr_scan_skims_iq_source_in_rf_hz() {
         2.0,
         Some(0.0),
     );
-    let iq: Vec<Complex32> = samples.iter().map(|&s| Complex32::new(s, 0.0)).collect();
+    // Real SDR IQ runs ~60 dB below full scale (AGC targets the whole
+    // passband, not one carrier) — scale down so the test fails if the
+    // decode chain ever reintroduces an audio-scale absolute threshold.
+    let iq: Vec<Complex32> = samples
+        .iter()
+        .map(|&s| Complex32::new(s * 1e-3, 0.0))
+        .collect();
     let source = FinitePacedIqSource {
         samples: iq,
         pos: 0,

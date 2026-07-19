@@ -248,6 +248,13 @@ fn build_sdr_app(
     } else {
         args
     };
+    if cfg!(debug_assertions) {
+        tracing::warn!(
+            "this is an unoptimized debug build — at SDR sample rates the DSP \
+             runs slower than real time and drops most of the signal; rebuild \
+             with `cargo run --release -p cwdit-server --features soapy`"
+        );
+    }
     let label = format!("sdr {driver} @ {:.4} MHz", freq_hz / 1_000_000.0);
     let tune_freq = freq_hz + lo_offset;
     let device_args = args.to_owned();

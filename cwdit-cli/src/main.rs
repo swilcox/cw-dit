@@ -40,6 +40,18 @@ const SKIM_MATCH_RADIUS_HZ: f32 = 25.0;
 /// Default absolute-envelope floor for the slicer in multi-channel mode.
 const DEFAULT_MULTI_ON_FLOOR: f32 = 0.08;
 
+/// Default slicer noise-floor guard (`--min-peak`) for audio input, where
+/// soundcard levels run near full scale.
+const AUDIO_MIN_PEAK: f32 = 0.005;
+
+/// The same guard for SDR IQ input, whose levels run ~60 dB lower: with
+/// AGC targeting the whole passband, a single CW carrier's [`IqTone`]
+/// envelope measures ~1e-4 keyed over ~3e-5 noise (`RSPdx`, 40 m) — the
+/// audio-scale
+/// guard sits far above the signal and mutes every channel. 1e-6 stays
+/// below real noise but above numerical dust.
+const IQ_MIN_PEAK: f32 = 1e-6;
+
 /// IQ-rate FFT auto-size targets bin spacing rather than dit width: at SDR
 /// rates the dit-width rule would pick FFTs too coarse to resolve adjacent
 /// CW signals (e.g. 245 Hz spacing at 1 Msps with N = 4096).
@@ -130,8 +142,10 @@ struct Args {
     peak_half_life: f32,
 
     /// Minimum envelope peak used as a noise-floor guard (0.0–1.0).
-    #[arg(long, default_value_t = 0.005)]
-    min_peak: f32,
+    /// Defaults to 0.005 for audio input and 1e-6 for SDR IQ, whose
+    /// sample levels run far lower.
+    #[arg(long)]
+    min_peak: Option<f32>,
 
     /// Absolute-envelope floor below which the slicer will never turn on.
     #[arg(long)]
@@ -228,6 +242,13 @@ impl Args {
     fn resolved_on_floor(&self, guard: bool) -> f32 {
         self.on_floor
             .unwrap_or(if guard { DEFAULT_MULTI_ON_FLOOR } else { 0.0 })
+    }
+
+    /// `min_peak` scaled to the input domain's envelope levels; see
+    /// [`AUDIO_MIN_PEAK`] / [`IQ_MIN_PEAK`].
+    fn resolved_min_peak(&self, iq: bool) -> f32 {
+        self.min_peak
+            .unwrap_or(if iq { IQ_MIN_PEAK } else { AUDIO_MIN_PEAK })
     }
 
     fn resolved_fft_size(&self, sample_rate: f32) -> usize {
@@ -342,6 +363,13 @@ fn run_sdr(args: &Args, sdr_args: &str) -> Result<(), Box<dyn Error>> {
     let rate = args.rf_rate.unwrap_or(DEFAULT_RF_SAMPLE_RATE);
     let lo_offset = args.lo_offset.unwrap_or(0.0);
     let tune_freq = center + lo_offset;
+    if cfg!(debug_assertions) {
+        eprintln!(
+            "cwdit: warning: unoptimized debug build — at SDR sample rates the \
+             DSP runs slower than real time and silently drops samples; rebuild \
+             with `cargo run --release -p cwdit-cli --features soapy`"
+        );
+    }
     let source = SoapySource::open(sdr_args, tune_freq, rate, args.rf_gain)?;
     if lo_offset == 0.0 {
         eprintln!(
@@ -396,7 +424,7 @@ fn decode_real<S: Source<Sample = f32>>(args: &Args, mut source: S) -> Result<()
         Box::new(GoertzelBackend::new(sample_rate, &tones, block_len))
     };
 
-    decode_pipeline(args, source, backend, &prefetch, &tones)
+    decode_pipeline(args, source, backend, &prefetch, &tones, args.resolved_min_peak(false))
 }
 
 #[cfg(feature = "soapy")]
@@ -442,7 +470,7 @@ fn decode_iq<S: Source<Sample = Complex32>>(
     }
 
     let backend = IqFftBackend::new(fft_size, hop, sample_rate, center_freq, &tones);
-    decode_pipeline(args, source, Box::new(backend), &prefetch, &tones)
+    decode_pipeline(args, source, Box::new(backend), &prefetch, &tones, args.resolved_min_peak(true))
 }
 
 /// Drive `source` through `backend`, post-process per-channel envelopes
@@ -453,6 +481,7 @@ fn decode_pipeline<T, S>(
     mut backend: Box<dyn Backend<Input = T>>,
     prefetch: &[T],
     tones: &[f32],
+    min_peak: f32,
 ) -> Result<(), Box<dyn Error>>
 where
     T: Copy + Default,
@@ -474,7 +503,7 @@ where
                 env_rate,
                 args.wpm,
                 args.peak_half_life,
-                args.min_peak,
+                min_peak,
                 on_floor,
                 args.snr_gate,
                 !args.fixed_timing,
@@ -586,7 +615,7 @@ struct LiveChannel<F: ToneFilter> {
 }
 
 impl<F: ToneFilter> LiveChannel<F> {
-    fn new(label: String, filter: F, env_rate: f32, args: &Args) -> Self {
+    fn new(label: String, filter: F, env_rate: f32, args: &Args, min_peak: f32) -> Self {
         Self {
             label,
             filter,
@@ -594,7 +623,7 @@ impl<F: ToneFilter> LiveChannel<F> {
                 env_rate,
                 args.wpm,
                 args.peak_half_life,
-                args.min_peak,
+                min_peak,
                 // Skim channels cleared the scan's SNR gate; see
                 // resolved_on_floor.
                 args.resolved_on_floor(false),
@@ -642,6 +671,10 @@ trait SkimMode {
     type Chan: Channelizer;
     type Filter: ToneFilter<Input = <Self::Chan as Channelizer>::Input>;
 
+    /// Default slicer noise-floor guard, scaled to this mode's envelope
+    /// levels ([`AUDIO_MIN_PEAK`] / [`IQ_MIN_PEAK`]).
+    const MIN_PEAK: f32;
+
     /// Scan bounds `(min, max)` in this mode's frequency units.
     fn scan_range(&self, args: &Args, sample_rate: f32) -> (f32, f32);
     /// Per-interval detector over the scan range.
@@ -666,6 +699,8 @@ struct AudioSkim;
 impl SkimMode for AudioSkim {
     type Chan = FftChannelizer;
     type Filter = Goertzel;
+
+    const MIN_PEAK: f32 = AUDIO_MIN_PEAK;
 
     fn scan_range(&self, args: &Args, _sample_rate: f32) -> (f32, f32) {
         (
@@ -718,6 +753,8 @@ struct IqSkim {
 impl SkimMode for IqSkim {
     type Chan = IqChannelizer;
     type Filter = IqTone;
+
+    const MIN_PEAK: f32 = IQ_MIN_PEAK;
 
     fn scan_range(&self, args: &Args, sample_rate: f32) -> (f32, f32) {
         // Default to the full passband minus a 5% guard at each edge, past
@@ -856,7 +893,13 @@ impl<'a, M: SkimMode> Skimmer<'a, M> {
         for &tone in &update.spawned {
             eprintln!("cwdit: channel + {}", self.mode.label(tone).trim());
             let filter = self.mode.make_filter(tone, self.sample_rate, self.block_len);
-            let mut ch = LiveChannel::new(self.mode.label(tone), filter, self.env_rate, self.args);
+            let mut ch = LiveChannel::new(
+                self.mode.label(tone),
+                filter,
+                self.env_rate,
+                self.args,
+                self.args.min_peak.unwrap_or(M::MIN_PEAK),
+            );
             // Replay the discovery interval so the transmission that
             // triggered detection is decoded from its start.
             for &s in self.detector.interval_audio() {

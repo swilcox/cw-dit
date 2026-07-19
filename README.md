@@ -107,30 +107,49 @@ close as stations come and go (add `--fft` for the older one-shot
 calibrate-then-decode flow). Built behind the `soapy` cargo feature so the
 SoapySDR linkage is opt-in.
 
+**Always build with `--release` for SDR input.** At MHz sample rates the
+DSP in a debug build runs several times slower than real time and drops
+most of the signal (both binaries warn at startup if you try).
+
 Install the host bits once (macOS examples — pick the driver modules that
 match your hardware):
 
 ```sh
-brew install soapysdr soapyrtlsdr soapysdrplay3
-SoapySDRUtil --probe="driver=sdrplay"   # smoke-test once each radio is plugged in
-SoapySDRUtil --probe="driver=rtlsdr"
+brew install soapysdr soapyrtlsdr
+SoapySDRUtil --probe="driver=rtlsdr"    # smoke-test once each radio is plugged in
 ```
 
-`soapysdrplay3` requires the closed-source SDRplay API service to be running
-for the SDRplay to enumerate; install it from sdrplay.com if `--probe` can't
-find the device.
+For an SDRplay there is no brew formula — install the closed-source SDRplay
+API from sdrplay.com (its launchd service must be running), then build the
+Soapy module from source and point it at brew's SoapySDR:
+
+```sh
+git clone https://github.com/pothosware/SoapySDRPlay3.git
+cmake -S SoapySDRPlay3 -B SoapySDRPlay3/build \
+    -DCMAKE_INSTALL_PREFIX=/opt/homebrew -DCMAKE_BUILD_TYPE=Release
+cmake --build SoapySDRPlay3/build -j && cmake --install SoapySDRPlay3/build
+# the SDRplay dylib is @rpath-linked; give the module a matching rpath:
+install_name_tool -add_rpath /usr/local/lib \
+    /opt/homebrew/lib/SoapySDR/modules0.8/libsdrPlaySupport.so
+codesign -f -s - /opt/homebrew/lib/SoapySDR/modules0.8/libsdrPlaySupport.so
+SoapySDRUtil --probe="driver=sdrplay"
+```
+
+If the probe reports *no available RSP devices found*, quit SDRconnect (or
+any other SDRplay app) first — it holds the radio's USB interface
+exclusively, so nothing else can enumerate it while it runs.
 
 Scan a CW segment of 40 m on an SDRplay (default driver):
 
 ```sh
-cargo run -p cwdit-cli --features soapy -- \
+cargo run --release -p cwdit-cli --features soapy -- \
     --sdr --freq 7035000 --rf-rate 2000000 --scan --wpm 25
 ```
 
 RTL-SDR with explicit driver args and manual gain:
 
 ```sh
-cargo run -p cwdit-cli --features soapy -- \
+cargo run --release -p cwdit-cli --features soapy -- \
     --sdr "driver=rtlsdr" --freq 7040000 --rf-rate 1024000 \
     --rf-gain 30 --scan --wpm 25
 ```
@@ -138,7 +157,7 @@ cargo run -p cwdit-cli --features soapy -- \
 Decode a fixed list of RF tones instead of scanning:
 
 ```sh
-cargo run -p cwdit-cli --features soapy -- \
+cargo run --release -p cwdit-cli --features soapy -- \
     --sdr --freq 7035000 --rf-rate 2000000 \
     --channels 7035500,7038200,7041000 --wpm 22
 ```
@@ -156,7 +175,7 @@ the whole passband's waterfall and every decoded station in the browser,
 labelled in absolute RF Hz. SDR input always scans (`--scan` is required):
 
 ```sh
-cargo run -p cwdit-server --features soapy -- \
+cargo run --release -p cwdit-server --features soapy -- \
     --sdr --freq 7035000 --rf-rate 2000000 --scan --wpm 25
 ```
 

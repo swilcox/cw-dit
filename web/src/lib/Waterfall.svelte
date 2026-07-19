@@ -102,17 +102,19 @@
 		border-radius: 6px;
 		display: block;
 	}
+	/* A short tick at the top edge only — a full-height line would sit on
+	   top of the very dits and dahs the display exists to show. */
 	.marker {
 		position: absolute;
 		top: 0;
-		bottom: 0;
+		height: 14px;
 		width: 0;
-		border-left: 1px dashed color-mix(in srgb, var(--accent) 65%, transparent);
+		border-left: 2px solid color-mix(in srgb, var(--accent) 85%, transparent);
 		pointer-events: none;
 	}
 	.tag {
 		position: absolute;
-		top: 2px;
+		top: 14px;
 		left: 3px;
 		font-family: ui-monospace, 'SF Mono', Menlo, monospace;
 		font-size: 0.65rem;
