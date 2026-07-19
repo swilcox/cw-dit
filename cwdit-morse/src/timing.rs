@@ -102,6 +102,26 @@ impl TimingEstimator {
         }
     }
 
+    /// Classify a key-down interval as a dit or a dah from the *period* it
+    /// spans together with its following intra-character gap. Envelope-
+    /// slicer edge erosion shortens a mark and widens the adjacent gap by
+    /// the same amount, so the period survives erosion that the raw mark
+    /// duration does not: a dit spans 2 T with its gap, a dah 4 T, split
+    /// at 3 T.
+    ///
+    /// Only intra-character gaps qualify: with an inter-character or word
+    /// gap folded in, the dit and dah periods sit too close together
+    /// (4 T vs 6 T, 8 T vs 10 T) and a modest unit-estimate error flips
+    /// elements — worse than the erosion the period would correct.
+    #[must_use]
+    pub fn classify_mark_by_period(&self, mark: u32, gap: u32) -> Element {
+        if ((mark + gap) as f32) < 3.0 * self.unit {
+            Element::Dit
+        } else {
+            Element::Dah
+        }
+    }
+
     /// Classify a key-up interval as an intra-character, inter-character, or
     /// word gap using the current dot-unit estimate.
     #[must_use]
@@ -132,6 +152,24 @@ impl TimingEstimator {
             // A dah is nominally 3 T; infer what T would make this dah exact.
             Element::Dah => duration as f32 / 3.0,
         };
+        self.adapt_toward(target, element);
+    }
+
+    /// Nudge the dot-unit estimate toward an observed mark + intra-character
+    /// gap period (2 T for a dit, 4 T for a dah). The period is invariant
+    /// to slicer edge erosion (see
+    /// [`classify_mark_by_period`](Self::classify_mark_by_period)), which
+    /// makes it a cleaner adaptation signal than the mark alone on a
+    /// fading channel.
+    pub fn observe_period(&mut self, period: u32, element: Element) {
+        let target = match element {
+            Element::Dit => period as f32 / 2.0,
+            Element::Dah => period as f32 / 4.0,
+        };
+        self.adapt_toward(target, element);
+    }
+
+    fn adapt_toward(&mut self, target: f32, element: Element) {
         if target < MIN_ADAPT_RATIO * self.unit || target > MAX_ADAPT_RATIO * self.unit {
             return;
         }

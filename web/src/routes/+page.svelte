@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { onDestroy, onMount } from 'svelte';
+	import { flip } from 'svelte/animate';
 	import Channel from '$lib/Channel.svelte';
 	import Waterfall from '$lib/Waterfall.svelte';
 	import type { DecodeEvent, SessionMode, Token } from '$lib/types';
@@ -26,10 +27,14 @@
 	let spectrumFMax = $state(0);
 	let ws: WebSocket | null = null;
 
+	// Live channels first (ordered by frequency, matching the waterfall
+	// left to right), closed channels sink below them.
 	const channelList = $derived(
 		Object.entries(channels)
 			.map(([id, c]) => ({ id: Number(id), ...c }))
-			.sort((a, b) => a.id - b.id)
+			.sort(
+				(a, b) => Number(a.closed) - Number(b.closed) || a.freqHz - b.freqHz || a.id - b.id
+			)
 	);
 	// Markers drawn over the waterfall — live channels only.
 	const liveMarkers = $derived(
@@ -140,14 +145,16 @@
 	{/if}
 	<div class="channels">
 		{#each channelList as ch (ch.id)}
-			<Channel
-				id={ch.id}
-				freqHz={ch.freqHz}
-				wpm={ch.wpm}
-				tokens={ch.tokens}
-				closed={ch.closed}
-				{done}
-			/>
+			<div animate:flip={{ duration: 400 }}>
+				<Channel
+					id={ch.id}
+					freqHz={ch.freqHz}
+					wpm={ch.wpm}
+					tokens={ch.tokens}
+					closed={ch.closed}
+					{done}
+				/>
+			</div>
 		{/each}
 		{#if done && channelList.length === 0}
 			<div class="empty">no channels</div>

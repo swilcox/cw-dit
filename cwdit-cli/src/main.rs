@@ -16,8 +16,9 @@ use std::path::PathBuf;
 use clap::Parser;
 use cwdit_dsp::{
     BinStats, ChannelTracker, Channelizer, Debouncer, Detector, DetectorConfig, FftChannelizer,
-    Goertzel, GoertzelBank, IqChannelizer, IqDetector, IqTone, MovingAverage, RunLengthEncoder,
-    ScanConfig, Threshold, ToneFilter, TrackerConfig, skim, suppress_correlated_ghosts,
+    Goertzel, GoertzelBank, IqChannelizer, IqDetector, IqTone, MovingAverage, QuantileSlicer,
+    RunLengthEncoder, ScanConfig, Slicer, Threshold, ToneFilter, TrackerConfig, skim,
+    suppress_correlated_ghosts,
 };
 use cwdit_morse::{BootstrapDecoder, Decoded, TimingEstimator};
 use cwdit_source::{AudioSource, IqWavSource, Source, WavSource};
@@ -47,6 +48,17 @@ struct ChainTuning {
     min_peak: f32,
     smooth_div: f32,
     min_run_div: f32,
+    /// `Some(rate)` slices with a [`QuantileSlicer`] tracking at `rate`
+    /// dB/s instead of the classic peak/floor [`Threshold`]. The rails
+    /// follow QSB fades that strand the classic peak tracker; ground-truth
+    /// sims showed ~4x lower character error rate through a 12 dB fade.
+    /// The `--on-floor` / `--snr-gate` / `--min-peak` slicer flags apply
+    /// only to the classic slicer.
+    rails_track_db_per_s: Option<f32>,
+    /// Classify marks by their erosion-invariant mark+gap period (see
+    /// `Decoder::with_period_classification`). Needs fine envelope
+    /// resolution: on for IQ (12 ticks/dit), off for audio (4).
+    period_classification: bool,
 }
 
 /// Audio input: soundcard levels run near full scale, and the envelope
@@ -55,6 +67,8 @@ const AUDIO_TUNING: ChainTuning = ChainTuning {
     min_peak: 0.005,
     smooth_div: 4.0,
     min_run_div: 5.0,
+    rails_track_db_per_s: None,
+    period_classification: false,
 };
 
 /// SDR IQ input. Levels run ~60 dB below audio (AGC targets the whole
@@ -68,6 +82,8 @@ const IQ_TUNING: ChainTuning = ChainTuning {
     min_peak: 1e-6,
     smooth_div: 1.5,
     min_run_div: 3.0,
+    rails_track_db_per_s: Some(cwdit_dsp::threshold::DEFAULT_TRACK_DB_PER_S),
+    period_classification: true,
 };
 
 /// IQ-rate FFT auto-size targets bin spacing rather than dit width: at SDR
@@ -1249,7 +1265,7 @@ impl Backend for IqFftBackend {
 /// Per-channel decode pipeline state.
 struct ChannelChain {
     smoother: MovingAverage,
-    threshold: Threshold,
+    slicer: Slicer,
     rle: RunLengthEncoder,
     debouncer: Debouncer,
     decoder: BootstrapDecoder,
@@ -1275,18 +1291,24 @@ impl ChannelChain {
         let dit_ticks = 1.2 * env_rate / wpm;
         let smooth_len = ((dit_ticks / tuning.smooth_div).round() as usize).clamp(2, 16);
         let min_run = ((dit_ticks / tuning.min_run_div) as u32).max(2);
-        let mut threshold = Threshold::new(env_rate, peak_half_life_s, tuning.min_peak);
-        if on_floor > 0.0 {
-            threshold = threshold.with_absolute_on_floor(on_floor);
-        }
-        if let Some(gate) = snr_gate {
-            threshold = threshold.with_snr_gate(gate);
-        }
-        let decoder =
-            BootstrapDecoder::new(TimingEstimator::from_wpm(wpm, env_rate)).with_adapt(adapt);
+        let slicer = if let Some(rate) = tuning.rails_track_db_per_s {
+            Slicer::Rails(QuantileSlicer::new(env_rate, rate))
+        } else {
+            let mut threshold = Threshold::new(env_rate, peak_half_life_s, tuning.min_peak);
+            if on_floor > 0.0 {
+                threshold = threshold.with_absolute_on_floor(on_floor);
+            }
+            if let Some(gate) = snr_gate {
+                threshold = threshold.with_snr_gate(gate);
+            }
+            Slicer::Classic(threshold)
+        };
+        let decoder = BootstrapDecoder::new(TimingEstimator::from_wpm(wpm, env_rate))
+            .with_adapt(adapt)
+            .with_period_classification(tuning.period_classification);
         Self {
             smoother: MovingAverage::new(smooth_len),
-            threshold,
+            slicer,
             rle: RunLengthEncoder::new(),
             debouncer: Debouncer::new(min_run),
             decoder,
@@ -1295,7 +1317,7 @@ impl ChannelChain {
     }
 
     fn feed_envelope(&mut self, env: f32) -> Vec<Decoded> {
-        let mark = self.threshold.push(self.smoother.push(env));
+        let mark = self.slicer.push(self.smoother.push(env));
         let mut out = Vec::new();
         if let Some(run) = self.rle.push(mark).and_then(|r| self.debouncer.push(r)) {
             for ev in self.decoder.push(run.mark, run.duration) {

@@ -38,5 +38,5 @@ pub use runlength::{Run, RunLengthEncoder};
 pub use scan::{BinStats, ScanConfig, envelope_correlation, suppress_correlated_ghosts};
 pub use skim::{Detector, DetectorConfig, IqDetector};
 pub use smooth::MovingAverage;
-pub use threshold::Threshold;
+pub use threshold::{QuantileSlicer, Slicer, Threshold};
 pub use track::{ChannelTracker, TrackerConfig, TrackerUpdate};

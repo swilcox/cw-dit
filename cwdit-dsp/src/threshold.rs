@@ -201,6 +201,153 @@ impl Threshold {
     }
 }
 
+/// Default rail tracking rate for [`QuantileSlicer`], in dB of amplitude
+/// per second. Fast enough to ride typical HF QSB (a few dB per second);
+/// much faster and the rails start following the keying itself.
+pub const DEFAULT_TRACK_DB_PER_S: f32 = 48.0;
+
+/// Rail span (log2 units; 1.0 ≈ 6 dB) below which [`QuantileSlicer`]
+/// squelches: mark and noise estimates this close together mean there is
+/// no keyed signal to slice.
+const SQUELCH_SPAN_LOG2: f32 = 1.0;
+
+/// A fresh signal this far (log2) above the high rail engages fast
+/// attack so acquisition takes a few marks, not seconds.
+const FAST_ATTACK_MARGIN_LOG2: f32 = 1.0;
+const FAST_ATTACK_ALPHA: f32 = 0.15;
+
+/// Quantile probabilities for the low (noise) and high (mark) rails.
+/// Marks occupy roughly a third to a half of active keying, so the 80th
+/// percentile sits inside the mark mode and the 20th inside the noise.
+const RAIL_P_LO: f32 = 0.2;
+const RAIL_P_HI: f32 = 0.8;
+
+/// Seconds of priming during which both rails EMA onto the observed
+/// envelope and the output is forced off.
+const RAIL_PRIMING_S: f32 = 0.3;
+
+/// Quantile-tracking envelope slicer for fading channels.
+///
+/// [`Threshold`]'s peak tracker only *decays* on wall-clock time: once a
+/// QSB dip drops the keyed level below the on-threshold, no marks are
+/// detected, so nothing realigns the peak — the slicer deadlocks until
+/// the decay catches up, and mid-fade copy is lost even at workable SNR.
+///
+/// This slicer instead tracks two quantiles of the log2 envelope with
+/// Robbins–Monro steps — a low rail near the noise floor ([`RAIL_P_LO`])
+/// and a high rail inside the mark level ([`RAIL_P_HI`]). The rails
+/// observe every envelope sample regardless of slicing state, so they
+/// follow a fade at the configured rate no matter what the slicer
+/// currently thinks is a mark. Slicing then uses the same linear-domain
+/// hysteresis fractions as [`Threshold`] over the rails' span, and a
+/// pinched span (under ~6 dB) squelches the output entirely — the
+/// noise-only-channel guard that [`Threshold`] gets from its SNR gate.
+#[derive(Debug, Clone)]
+pub struct QuantileSlicer {
+    lo: f32,
+    hi: f32,
+    step: f32,
+    on: bool,
+    priming_left: u32,
+}
+
+impl QuantileSlicer {
+    /// Create a slicer whose rails can follow a level change at
+    /// `track_db_per_s` dB of amplitude per second.
+    ///
+    /// # Panics
+    /// Panics if either argument is not positive.
+    #[must_use]
+    pub fn new(envelope_sample_rate_hz: f32, track_db_per_s: f32) -> Self {
+        assert!(envelope_sample_rate_hz > 0.0);
+        assert!(track_db_per_s > 0.0);
+        // A rail's fast direction moves at step × max(p, 1-p) per sample;
+        // scale so that direction meets the requested dB/s. (The slow
+        // direction is 4× slower — that asymmetry is what pins each rail
+        // to its quantile.)
+        let db_per_sample = track_db_per_s / envelope_sample_rate_hz;
+        let step = (db_per_sample / 6.02) / RAIL_P_HI;
+        Self {
+            lo: -20.0,
+            hi: -10.0,
+            step,
+            on: false,
+            priming_left: (RAIL_PRIMING_S * envelope_sample_rate_hz).ceil().max(1.0) as u32,
+        }
+    }
+
+    /// Feed one envelope sample. Returns the current key state
+    /// (`true` = key down / mark).
+    pub fn push(&mut self, envelope: f32) -> bool {
+        let x = envelope.max(1e-12).log2();
+        if self.priming_left > 0 {
+            self.priming_left -= 1;
+            let a = 0.05;
+            self.lo += a * (x - self.lo);
+            self.hi += a * (x - self.hi);
+            return false;
+        }
+
+        // Robbins–Monro quantile steps: q += step × (p − [x < q]).
+        self.lo += self.step * (if x < self.lo { RAIL_P_LO - 1.0 } else { RAIL_P_LO });
+        if x > self.hi + FAST_ATTACK_MARGIN_LOG2 {
+            self.hi += FAST_ATTACK_ALPHA * (x - self.hi);
+        } else {
+            self.hi += self.step * (if x < self.hi { RAIL_P_HI - 1.0 } else { RAIL_P_HI });
+        }
+        if self.hi < self.lo {
+            self.hi = self.lo;
+        }
+
+        if self.hi - self.lo < SQUELCH_SPAN_LOG2 {
+            self.on = false;
+            return false;
+        }
+
+        let lo_lin = self.lo.exp2();
+        let span_lin = (self.hi.exp2() - lo_lin).max(0.0);
+        if self.on {
+            if envelope < lo_lin + DEFAULT_OFF_FRACTION * span_lin {
+                self.on = false;
+            }
+        } else if envelope > lo_lin + DEFAULT_ON_FRACTION * span_lin {
+            self.on = true;
+        }
+        self.on
+    }
+
+    /// Current mark-level (high-rail) estimate, linear. Exposed for tests.
+    #[must_use]
+    pub fn mark_level(&self) -> f32 {
+        self.hi.exp2()
+    }
+
+    /// Current noise-level (low-rail) estimate, linear. Exposed for tests.
+    #[must_use]
+    pub fn noise_level(&self) -> f32 {
+        self.lo.exp2()
+    }
+}
+
+/// Either envelope slicer behind a single `push`, so decode chains can
+/// pick per input domain ([`Threshold`] for near-full-scale audio,
+/// [`QuantileSlicer`] for fading SDR IQ) without generics.
+#[derive(Debug, Clone)]
+pub enum Slicer {
+    Classic(Threshold),
+    Rails(QuantileSlicer),
+}
+
+impl Slicer {
+    /// Feed one envelope sample. Returns the current key state.
+    pub fn push(&mut self, envelope: f32) -> bool {
+        match self {
+            Self::Classic(t) => t.push(envelope),
+            Self::Rails(q) => q.push(envelope),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -329,6 +476,119 @@ mod tests {
             t.floor() < 0.2,
             "floor must freeze while the key is down, got {}",
             t.floor()
+        );
+    }
+
+    // --- QuantileSlicer ---
+
+    const Q_RATE: f32 = 200.0;
+
+    /// Keyed envelope at IQ-like levels: `pattern` gives per-dit key
+    /// states, `dit_ticks` envelope samples per dit, ±30% noise on the
+    /// noise level and ±10% on the mark level.
+    fn keyed_env(pattern: &[bool], dit_ticks: usize, mark: f32, noise_lvl: f32) -> Vec<f32> {
+        let mut out = Vec::new();
+        let mut seed = 7_u32;
+        let mut rnd = move || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 8) as f32 / (1 << 24) as f32
+        };
+        for &k in pattern {
+            for _ in 0..dit_ticks {
+                if k {
+                    out.push(mark * (0.9 + 0.2 * rnd()));
+                } else {
+                    out.push(noise_lvl * (0.7 + 0.6 * rnd()));
+                }
+            }
+        }
+        out
+    }
+
+    /// Fraction of post-settle samples (priming plus rail acquisition,
+    /// ~0.5 s) where the slicer output matches the key.
+    fn key_agreement(s: &mut QuantileSlicer, pattern: &[bool], env: &[f32], dit_ticks: usize) -> f32 {
+        let settle = (0.5 * Q_RATE) as usize;
+        let mut hits = 0usize;
+        for (i, &e) in env.iter().enumerate() {
+            if s.push(e) == pattern[i / dit_ticks] && i >= settle {
+                hits += 1;
+            }
+        }
+        hits as f32 / (env.len() - settle) as f32
+    }
+
+    #[test]
+    fn quantile_slicer_slices_clean_keying() {
+        // "PARIS "-ish alternation at IQ envelope levels.
+        let pattern: Vec<bool> = [true, false, true, true, true, false, false, false]
+            .repeat(40);
+        let env = keyed_env(&pattern, 12, 1e-4, 3e-5);
+        let mut s = QuantileSlicer::new(Q_RATE, DEFAULT_TRACK_DB_PER_S);
+        let agree = key_agreement(&mut s, &pattern, &env, 12);
+        assert!(agree > 0.9, "agreement {agree}");
+    }
+
+    #[test]
+    fn quantile_slicer_stays_off_on_noise() {
+        let pattern = vec![false; 400];
+        let env = keyed_env(&pattern, 12, 0.0, 3e-5);
+        let mut s = QuantileSlicer::new(Q_RATE, DEFAULT_TRACK_DB_PER_S);
+        let marks = env.iter().filter(|&&e| s.push(e)).count();
+        assert!(
+            marks < env.len() / 100,
+            "noise-only channel produced {marks} mark ticks"
+        );
+    }
+
+    #[test]
+    fn quantile_slicer_follows_a_deep_fade() {
+        // Keyed signal that fades 18 dB over ~2 s and stays there: rails
+        // must re-acquire and keep slicing at the faded level.
+        let pattern: Vec<bool> = [true, false, true, true, true, false, false, false]
+            .repeat(80);
+        let mut env = keyed_env(&pattern, 12, 1e-4, 3e-6);
+        let n = env.len();
+        for (i, e) in env.iter_mut().enumerate() {
+            let t = i as f32 / n as f32;
+            // Fade from 0 dB to −18 dB across the first half, hold after.
+            let fade_db = 18.0 * (2.0 * t).min(1.0);
+            let g = 10f32.powf(-fade_db / 20.0);
+            if *e > 1e-5 {
+                *e *= g;
+            }
+        }
+        let mut s = QuantileSlicer::new(Q_RATE, DEFAULT_TRACK_DB_PER_S);
+        // Agreement over the FADED second half is what matters.
+        let half = n / 2;
+        let mut hits = 0usize;
+        for (i, &e) in env.iter().enumerate() {
+            let mark = s.push(e);
+            if i >= half && mark == pattern[i / 12] {
+                hits += 1;
+            }
+        }
+        let agree = hits as f32 / (n - half) as f32;
+        assert!(agree > 0.85, "faded-half agreement {agree}");
+    }
+
+    #[test]
+    fn quantile_slicer_rails_track_levels() {
+        let pattern: Vec<bool> = [true, false].repeat(300);
+        let env = keyed_env(&pattern, 12, 2e-4, 3e-5);
+        let mut s = QuantileSlicer::new(Q_RATE, DEFAULT_TRACK_DB_PER_S);
+        for &e in &env {
+            s.push(e);
+        }
+        let mark = s.mark_level();
+        let noise = s.noise_level();
+        assert!(
+            (1e-4..4e-4).contains(&mark),
+            "mark rail {mark} not near 2e-4"
+        );
+        assert!(
+            (1e-5..1e-4).contains(&noise),
+            "noise rail {noise} not near 3e-5"
         );
     }
 }

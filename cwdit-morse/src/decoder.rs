@@ -18,11 +18,31 @@ use crate::timing::TimingEstimator;
 const MAX_PATTERN: usize = 10;
 
 /// Streaming Morse decoder.
+///
+/// Marks are classified with one run of lookahead: a mark is held until
+/// the following gap arrives, and when that gap is intra-character the
+/// *mark + gap period* decides dit vs dah. On a fading channel the slicer
+/// erodes mark edges symmetrically — the mark shortens and the adjacent
+/// gap widens by the same amount — so the period is invariant to erosion
+/// where the raw mark duration is not: a dit plus its intra-character gap
+/// spans 2 T and a dah plus its gap spans 4 T regardless of how much the
+/// edges were eaten. Marks before inter-character and word gaps classify
+/// on their raw duration (see
+/// [`TimingEstimator::classify_mark_by_period`] for why).
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)] // two config flags + two event latches
 pub struct Decoder {
     timing: TimingEstimator,
     pattern: heapless_pattern::Pattern,
     adapt: bool,
+    /// Classify marks by mark+gap period when the following gap is
+    /// intra-character (see type-level docs). Worth enabling only when
+    /// the envelope runs fine enough (~10+ ticks/dit) that gap durations
+    /// carry signal rather than quantisation noise.
+    period_classification: bool,
+    /// Duration of the most recent mark, classification deferred until the
+    /// following gap (or `finish`) supplies the period context.
+    pending_mark: Option<u32>,
     /// Whether any character has been emitted yet. Suppresses
     /// leading `WordBreak` events produced by an initial run of silence.
     any_char_emitted: bool,
@@ -41,6 +61,8 @@ impl Decoder {
             timing,
             pattern: heapless_pattern::Pattern::new(),
             adapt: true,
+            period_classification: false,
+            pending_mark: None,
             any_char_emitted: false,
             pending_word_break: false,
         }
@@ -51,6 +73,16 @@ impl Decoder {
     #[must_use]
     pub const fn with_adapt(mut self, adapt: bool) -> Self {
         self.adapt = adapt;
+        self
+    }
+
+    /// Enable erosion-robust mark classification and adaptation via the
+    /// mark + intra-character-gap period. Only worthwhile at fine envelope
+    /// resolution (~10+ ticks/dit); at coarse resolution the gap's
+    /// quantisation noise outweighs the erosion it corrects.
+    #[must_use]
+    pub const fn with_period_classification(mut self, on: bool) -> Self {
+        self.period_classification = on;
         self
     }
 
@@ -68,13 +100,18 @@ impl Decoder {
     pub fn push(&mut self, mark: bool, duration: u32) -> DecodedBatch {
         let mut out = DecodedBatch::new();
         if mark {
-            let element = self.timing.classify_mark(duration);
-            self.pattern.push(element.glyph());
-            if self.adapt {
-                self.timing.observe_mark(duration, element);
+            if let Some(prev) = self.pending_mark.take() {
+                // Consecutive marks (a debouncer merge artefact): classify
+                // the earlier one without period context.
+                self.classify_pending(prev, None);
             }
+            self.pending_mark = Some(duration);
         } else {
-            match self.timing.classify_gap(duration) {
+            let gap = self.timing.classify_gap(duration);
+            if let Some(m) = self.pending_mark.take() {
+                self.classify_pending(m, Some((duration, gap)));
+            }
+            match gap {
                 Gap::IntraChar => {}
                 Gap::Char => self.flush(&mut out),
                 Gap::Word => {
@@ -91,6 +128,29 @@ impl Decoder {
         out
     }
 
+    /// Classify a completed mark, using the following gap's period when
+    /// available (see the type-level docs), append its glyph, and feed the
+    /// timing estimator.
+    fn classify_pending(&mut self, mark: u32, following: Option<(u32, Gap)>) {
+        let intra_gap = match following {
+            Some((gap, Gap::IntraChar)) if self.period_classification => Some(gap),
+            _ => None,
+        };
+        let element = match intra_gap {
+            Some(gap) => self.timing.classify_mark_by_period(mark, gap),
+            None => self.timing.classify_mark(mark),
+        };
+        self.pattern.push(element.glyph());
+        if self.adapt {
+            match intra_gap {
+                // The mark + intra-char gap period is erosion-invariant, so
+                // it is a cleaner adaptation signal than the mark alone.
+                Some(gap) => self.timing.observe_period(mark + gap, element),
+                None => self.timing.observe_mark(mark, element),
+            }
+        }
+    }
+
     /// Flush any in-progress character. Call after the input stream ends to
     /// avoid losing a trailing character that wasn't followed by a gap.
     ///
@@ -98,6 +158,9 @@ impl Decoder {
     /// [`WordBreak`](Decoded::WordBreak) in front of the final character.
     pub fn finish(&mut self) -> DecodedBatch {
         let mut out = DecodedBatch::new();
+        if let Some(m) = self.pending_mark.take() {
+            self.classify_pending(m, None);
+        }
         self.flush(&mut out);
         out
     }
@@ -328,6 +391,30 @@ mod tests {
         }
         let out = run(&mut dec, &events);
         assert_eq!(out, vec![Decoded::Unknown]);
+    }
+
+    /// A fade-eroded dah (shortened below the 2 T raw boundary, with the
+    /// lost time reappearing in the following intra-character gap) must
+    /// still classify as a dah via the mark+gap period. Raw-duration
+    /// classification would read this "D" as "S".
+    #[test]
+    fn eroded_dah_rescued_by_period_classification() {
+        let mut dec = Decoder::new(TimingEstimator::from_unit(100))
+            .with_adapt(false)
+            .with_period_classification(true);
+        // "D" = dah dit dit at T=100; the dah's trailing edge eroded by
+        // 120 (180 left, below the 2 T raw dit/dah boundary), the lost
+        // time reappearing in the following gap (160). The mark+gap
+        // period (340) still reads dah against the 3 T boundary.
+        let events = [
+            (true, 180),
+            (false, 160),
+            (true, 80),
+            (false, 120),
+            (true, 100),
+        ];
+        let out = run(&mut dec, &events);
+        assert_eq!(out, vec![Decoded::Char('D')]);
     }
 
     #[test]

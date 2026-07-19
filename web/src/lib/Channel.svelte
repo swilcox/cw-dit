@@ -34,7 +34,7 @@
 		background: var(--panel);
 		border: 1px solid var(--panel-border);
 		border-radius: 6px;
-		padding: 0.75rem 1rem 1rem;
+		padding: 0.5rem 0.75rem 0.6rem;
 	}
 	.channel.done {
 		border-color: var(--accent);
@@ -47,22 +47,23 @@
 		justify-content: space-between;
 		align-items: baseline;
 		font-family: ui-monospace, 'SF Mono', Menlo, monospace;
-		font-size: 0.85rem;
+		font-size: 0.75rem;
 		color: var(--mute);
-		margin-bottom: 0.5rem;
+		margin-bottom: 0.3rem;
 	}
 	.label {
 		color: var(--fg);
 	}
+	/* Compact: many channels need to share the screen with the waterfall. */
 	.text {
 		font-family: ui-monospace, 'SF Mono', Menlo, monospace;
-		font-size: 1.4rem;
+		font-size: 0.95rem;
 		white-space: pre-wrap;
 		word-break: break-word;
 		background: #000;
 		border-radius: 4px;
-		padding: 0.6rem 0.8rem;
-		min-height: 3rem;
+		padding: 0.35rem 0.55rem;
+		min-height: 1.4rem;
 	}
 	.unknown {
 		color: var(--warn);

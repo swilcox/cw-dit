@@ -34,6 +34,7 @@ pub struct BootstrapDecoder {
     inner: Option<Decoder>,
     seed_timing: TimingEstimator,
     adapt: bool,
+    period_classification: bool,
     target_marks: u32,
     marks_observed: u32,
     buffered: Vec<(bool, u32)>,
@@ -48,6 +49,7 @@ impl BootstrapDecoder {
             inner: None,
             seed_timing,
             adapt: true,
+            period_classification: false,
             target_marks: DEFAULT_BOOTSTRAP_MARKS,
             marks_observed: 0,
             buffered: Vec::new(),
@@ -69,6 +71,14 @@ impl BootstrapDecoder {
     #[must_use]
     pub const fn with_adapt(mut self, adapt: bool) -> Self {
         self.adapt = adapt;
+        self
+    }
+
+    /// Forwarded to [`Decoder::with_period_classification`] on the inner
+    /// decoder created when bootstrap completes.
+    #[must_use]
+    pub const fn with_period_classification(mut self, on: bool) -> Self {
+        self.period_classification = on;
         self
     }
 
@@ -135,7 +145,11 @@ impl BootstrapDecoder {
             let unit = estimate_unit_from_marks(&mark_durations);
             TimingEstimator::from_unit(unit)
         };
-        self.inner = Some(Decoder::new(timing).with_adapt(self.adapt));
+        self.inner = Some(
+            Decoder::new(timing)
+                .with_adapt(self.adapt)
+                .with_period_classification(self.period_classification),
+        );
     }
 
     fn replay_buffered(&mut self) -> Vec<Decoded> {
